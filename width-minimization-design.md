@@ -34,7 +34,8 @@ design, but it already exercises both the local and global parts of the plan.
 Implemented today:
 
 - local compare shrinking for selected ext/ext patterns
-- local compare shrinking for mixed `sext`/`zext` `eq/ne`
+- local compare shrinking for mixed `sext`/`zext` `eq/ne`, including the extra
+  distinguishing bit needed for equal-width mixed-sign cases
 - local `icmp` + `select` to min/max canonicalization
 - local `phi` and `select` shrinking for `zext`/`sext` inputs plus fitting
   constants, including mixed narrow widths through a common intermediate width
@@ -50,6 +51,9 @@ Implemented today:
 - local widening of a `zext -> add -> zext` chain into a reused wider path
 - plan-driven widening of small width-polymorphic components
   - currently `phi`, `select`, `freeze`, `and`, `or`, `xor`
+- target-width-extension-aware sign selection inside widened components so the
+  internal representation matches the dominant removable `zext`/`sext`
+  boundary kind
 - per-edge boundary repair for widened components
 - planner-side compare affinities so `icmp` operands can pull component widths
   toward agreement

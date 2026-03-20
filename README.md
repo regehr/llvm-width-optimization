@@ -47,7 +47,8 @@ currently comes from targeted local rewrites that complement the planner.
   - `zext/zext`
   - `sext/sext`
   - mixed `sext/zext` for signed predicates
-  - mixed `sext/zext` for `eq/ne`
+  - mixed `sext/zext` for `eq/ne`, with one extra distinguishing bit when
+    needed
 - `icmp` + `select` to `llvm.smin/smax/umin/umax`
 - `phi` shrinking for `zext` or `sext` inputs plus fitting constants,
   including mixed narrow widths through a common intermediate width
@@ -73,6 +74,8 @@ currently comes from targeted local rewrites that complement the planner.
   extension path
 - plan-driven widening of components built from `phi`, `select`, `freeze`,
   `and`, `or`, and `xor`
+- target-width-extension-aware sign selection for widened components so the
+  internal representation matches the dominant removable boundary casts
 - per-edge boundary repair for widened components, including retargeting
   external `icmp` users when the widened representation is compatible
 
@@ -218,25 +221,6 @@ proof and regression discipline.
   `freeze`, `and`, `or`, and `xor`. That mismatch lets neighboring components
   optimize against width choices that never materialize, which directly weakens
   the final result.
-- improve the widened-component internal sign policy so one target-width
-  `zext` user does not block elimination of many target-width `sext` users, or
-  vice versa
-  The current widener chooses a sign-extended internal representation only when
-  there are target-width `sext` consumers and zero target-width `zext`
-  consumers; otherwise it defaults to zero-extension. Because existing target-
-  width extensions are removed only when that exact internal choice matches
-  them, this coarse policy can leave a large number of removable extensions in
-  place.
-- audit and either prove or remove the mixed `sext`/`zext` `icmp eq/ne`
-  shrinking rule
-  The current implementation and tests claim that equality across mixed sign
-  and zero extensions can always be narrowed to the max of the source widths.
-  That deserves a dedicated re-check because it appears suspicious when the two
-  source widths are equal: for example, `sext i8 0x80` and `zext i8 0x80` are
-  not equal at the wide width, but the narrowed `icmp eq i8` would report them
-  equal. This is a correctness TODO rather than an effectiveness TODO, but it
-  is important enough to keep visible in the near-term work list.
-
 - generalize the global planner beyond the current simple heuristic and binary
   candidate model
 - broaden plan-driven rewrites to more instruction kinds than the current small

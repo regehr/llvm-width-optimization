@@ -347,8 +347,16 @@ unsigned computeShrinkWidth(ICmpInst::Predicate Pred, const ExtOperandInfo &LHS,
     return 0;
   }
 
-  if (isEqOrNe(Pred))
-    return std::max(LHS.NarrowWidth, RHS.NarrowWidth);
+  if (isEqOrNe(Pred)) {
+    // Mixed sign/zero-extension equality also needs one extra distinguishing
+    // bit on the zero-extended side. Without it, equal-width cases like
+    // sext(i8 0x80) == zext(i8 0x80) would collapse to a wrong true i8 compare.
+    if (LHS.Kind == ExtKind::SExt && RHS.Kind == ExtKind::ZExt)
+      return std::max(LHS.NarrowWidth, RHS.NarrowWidth + 1);
+    if (LHS.Kind == ExtKind::ZExt && RHS.Kind == ExtKind::SExt)
+      return std::max(LHS.NarrowWidth + 1, RHS.NarrowWidth);
+    llvm_unreachable("Mixed extension pairs should cover all remaining cases");
+  }
 
   if (!isSignedICmp(Pred))
     return 0;
@@ -2164,8 +2172,8 @@ bool tryWidenComponentFromPlan(const Component &C, const AnalysisResult &R,
     if (!isWidenablePolyInstruction(*I))
       return false;
 
-  bool SawZExtToTarget = false;
-  bool SawSExtToTarget = false;
+  unsigned NumZExtToTarget = 0;
+  unsigned NumSExtToTarget = 0;
   SmallVector<ExternalExtUser, 8> ExternalUsers;
   for (Value *V : C.Values) {
     for (User *U : V->users()) {
@@ -2179,10 +2187,12 @@ bool tryWidenComponentFromPlan(const Component &C, const AnalysisResult &R,
         if (Z->getOperand(0) != V)
           return false;
         if (getValueWidth(Z) == TargetWidth)
-          SawZExtToTarget = true;
+          ++NumZExtToTarget;
       } else if (auto *S = dyn_cast<SExtInst>(UserI)) {
         if (S->getOperand(0) != V)
           return false;
+        if (getValueWidth(S) == TargetWidth)
+          ++NumSExtToTarget;
       }
 
       ExternalUsers.push_back(ExternalExtUser{UserI, V});
@@ -2194,18 +2204,11 @@ bool tryWidenComponentFromPlan(const Component &C, const AnalysisResult &R,
   if (ExternalUsers.empty())
     return false;
 
-  for (const ExternalExtUser &EU : ExternalUsers)
-    if (auto *S = dyn_cast<SExtInst>(EU.User))
-      if (getValueWidth(S) == TargetWidth)
-        SawSExtToTarget = true;
-
-  // Policy choice: prefer a zero-extended internal representation unless all
-  // target-width consumers specifically want sign extension. Zero extension is
-  // the more neutral choice because we can always reconstruct the original
-  // narrow value with a truncation at the boundary and then re-extend it per
-  // edge when needed.
-  ExtKind InternalKind =
-      SawSExtToTarget && !SawZExtToTarget ? ExtKind::SExt : ExtKind::ZExt;
+  // Policy choice: pick the target-width extension kind that eliminates the
+  // larger number of existing boundary casts. Ties still prefer zero
+  // extension because it remains the more neutral boundary representation.
+  ExtKind InternalKind = NumSExtToTarget > NumZExtToTarget ? ExtKind::SExt
+                                                           : ExtKind::ZExt;
 
   auto *TargetTy = IntegerType::get(C.Instructions.front()->getContext(),
                                     TargetWidth);
