@@ -1509,9 +1509,10 @@ bool collectTruncRootedValueCost(
     SmallPtrSetImpl<Instruction *> &RemovedInstructions,
     SmallPtrSetImpl<Value *> &Visited);
 
-bool tryShrinkTruncOfAdd(TruncInst &Tr) {
+bool tryShrinkTruncOfLowBitsBinOp(TruncInst &Tr) {
   auto *BO = dyn_cast<BinaryOperator>(Tr.getOperand(0));
-  if (!BO || BO->getOpcode() != Instruction::Add || !BO->hasOneUse())
+  if (!BO || !isTruncRootedLowBitsPreservingOpcode(BO->getOpcode()) ||
+      !BO->hasOneUse())
     return false;
   if (!isIntegerValue(&Tr) || !isIntegerValue(BO) ||
       !isIntegerValue(BO->getOperand(0)) || !isIntegerValue(BO->getOperand(1)))
@@ -1551,9 +1552,10 @@ bool tryShrinkTruncOfAdd(TruncInst &Tr) {
     return false;
 
   IRBuilder<> B(&Tr);
-  auto *NewAdd = cast<Instruction>(B.CreateAdd(LHS, RHS, Tr.getName()));
-  NewAdd->setDebugLoc(Tr.getDebugLoc());
-  Tr.replaceAllUsesWith(NewAdd);
+  auto *NewBO = cast<Instruction>(B.CreateBinOp(
+      (Instruction::BinaryOps)BO->getOpcode(), LHS, RHS, Tr.getName()));
+  NewBO->setDebugLoc(Tr.getDebugLoc());
+  Tr.replaceAllUsesWith(NewBO);
   Tr.eraseFromParent();
 
   if (BO->use_empty())
@@ -2312,7 +2314,7 @@ bool runStructuralLocalRewritesToFixpoint(Function &F) {
         ChangedThisRound = true;
         continue;
       }
-      ChangedThisRound |= tryShrinkTruncOfAdd(*Tr);
+      ChangedThisRound |= tryShrinkTruncOfLowBitsBinOp(*Tr);
     }
 
     for (SExtInst *SExt : WL.SExts) {

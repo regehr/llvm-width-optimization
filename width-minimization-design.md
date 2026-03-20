@@ -53,10 +53,9 @@ Implemented today:
   known zero
 - local folding of `trunc(sext(x))` or `trunc(zext(x))` back to the original
   source width or a narrower trunc of that source
-- local `zext(trunc(x))` to mask formation, including fixed integer vectors
-- trunc-rooted shrinking for selected `add`, `select`, and shift-recurrence
-  patterns, including recursive rebuilding through low-bit-preserving
-  `add/sub/mul/and/or/xor` structure under a root trunc
+- local `zext(trunc(x))` to mask formation
+- trunc-rooted shrinking for low-bit-preserving `add/sub/mul/and/or/xor`
+  expressions, plus selected `select` and shift-recurrence patterns
 - range-driven `udiv` narrowing
 - local widening of a `zext -> add -> zext` chain into a reused wider path
 - plan-driven widening of small width-polymorphic components
@@ -76,6 +75,7 @@ Current policy boundaries:
 
 - `i1` components are pinned and excluded from the global width search
 - the generic widener currently supports only small width-polymorphic regions
+- vector instructions are currently out of scope
 - many arithmetic improvements still come from targeted local rewrites rather
   than the global planner
 - implementation TODOs and current regression priorities live in `README.md`

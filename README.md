@@ -72,10 +72,11 @@ currently comes from targeted local rewrites that complement the planner.
   known zero
 - `trunc(sext(x))` or `trunc(zext(x))` folding back to the source width or a
   narrower trunc of the original source
-- `zext(trunc(x))` to low-bit masking, including fixed integer vectors
+- `zext(trunc(x))` to low-bit masking
 - trunc-rooted shrinking for:
-  - `add`, including recursive rebuilding through low-bit-preserving
-    `add/sub/mul/and/or/xor` subexpressions when the root trunc pays for it
+  - low-bit-preserving `add/sub/mul/and/or/xor` expressions when removable
+    boundary instructions pay for rebuilding the expression at the truncated
+    width
   - `select`
   - simple loop-carried `shl` recurrences
 - `udiv` retargeting when range facts and removable width changes make it
@@ -247,16 +248,10 @@ proof and regression discipline.
 - relax shared-extension merge handling so the pass keeps up with LLVM on the
   remaining conditional-dataflow case
   Current oracle losses: `test/width-opt-select-shared-ext-user-repair.ll`.
-- make the compare, trunc-rooted, and `zext(trunc(x))` rewrites work for the
-  remaining vector cases where LLVM still removes casts and `width-opt` does
-  not
-  Current oracle losses: `test/width-opt-icmp-eq-vector-no-crash.ll`,
-  `test/width-opt-trunc-add-vector-no-crash.ll`,
-  and `test/width-opt-trunc-icmp-vector-no-crash.ll`.
-- generalize trunc-rooted arithmetic shrinking beyond the current targeted
-  helpers
+- handle vector instructions
+- broaden trunc-rooted shrinking beyond the current low-bit-preserving
+  binops, `select`, and shift-recurrence cases
 - add more direct profitability modeling so local widen/narrow decisions align
   better with the global objective
 - add fresh regression cases under `test/` as new optimizer gaps are
   discovered
-- make everything work for vector instructions
