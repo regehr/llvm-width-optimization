@@ -15,8 +15,8 @@ entry:
 ; CHECK-LABEL: define i32 @f(
 ; CHECK: %[[S:.*]] = select i1 %c, i32 -1, i32 2
 ; CHECK-NOT: sext i8
-; CHECK: %[[N:.*]] = trunc i32 %[[S]] to i8
-; CHECK: %[[Z:.*]] = zext i8 %[[N]] to i32
+; CHECK: %[[Z:.*]] = and i32 %[[S]], 255
+; CHECK-NOT: trunc i32 %[[S]] to i8
 ; CHECK: %[[R:.*]] = add i32 %[[S]], %[[S]]
 ; CHECK: %[[T:.*]] = add i32 %[[R]], %[[Z]]
 ; CHECK: ret i32 %[[T]]

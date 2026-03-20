@@ -23,9 +23,10 @@ merge:
 
 ; CHECK-LABEL: define i32 @f(
 ; CHECK: merge:
-; CHECK: %[[P:.*]] = phi i32 [ %{{.*}}, %left ], [ 7, %right ]
-; CHECK: %[[FR:.*]] = freeze i32 %[[P]]
-; CHECK: %[[O:.*]] = or i32 %[[FR]], 1
+; CHECK: %[[P:.*]] = phi i8 [ %x, %left ], [ 7, %right ]
+; CHECK: %[[FR:.*]] = freeze i8 %[[P]]
+; CHECK: %[[W:.*]] = zext i8 %[[FR]] to i32
+; CHECK: %[[O:.*]] = or i32 %[[W]], 1
 ; CHECK-NOT: zext i8 %o to i32
 ; CHECK: %[[SUM:.*]] = add i32 %[[O]], %[[O]]
 ; CHECK: ret i32 %[[SUM]]

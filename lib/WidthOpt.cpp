@@ -2775,8 +2775,16 @@ PreservedAnalyses WidthOptPass::run(Function &F, FunctionAnalysisManager &AM) {
 
   // The plan is currently consumed only by widening transforms. Narrowing is
   // still handled by the local folds above.
+  bool ChangedByPlan = false;
   for (const Component &C : R.Components)
-    Changed |= tryWidenComponentFromPlan(C, R, Plan);
+    ChangedByPlan |= tryWidenComponentFromPlan(C, R, Plan);
+  Changed |= ChangedByPlan;
+
+  // Plan-driven widening can create fresh structural cleanup opportunities
+  // such as zext(trunc(widened-value)) patterns that were not present before
+  // the global step ran.
+  if (ChangedByPlan)
+    Changed |= runStructuralLocalRewritesToFixpoint(F);
 
   if (!Changed)
     return PreservedAnalyses::all();

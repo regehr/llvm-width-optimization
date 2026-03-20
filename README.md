@@ -240,10 +240,6 @@ proof and regression discipline.
 - relax shared-extension merge handling so the pass keeps up with LLVM on the
   remaining conditional-dataflow case
   Current oracle losses: `test/width-opt-select-shared-ext-user-repair.ll`.
-- improve mixed-kind widened-component cleanup so the pass keeps up with LLVM
-  on the remaining scalar mixed-extension case
-  Current oracle losses:
-  `test/width-opt-component-widen-mixed-ext-kinds-prefer-sext.ll`.
 - strengthen trunc-rooted arithmetic handling where shared wide operands still
   block profitable narrowing
   Current oracle losses: `test/width-opt-trunc-add-wide-operands-no-increase.ll`.

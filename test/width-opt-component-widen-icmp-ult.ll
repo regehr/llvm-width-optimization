@@ -27,12 +27,12 @@ merge:
 
 ; CHECK-LABEL: define i32 @f(
 ; CHECK: merge:
-; CHECK: %[[P:.*]] = phi i32 [ %{{.*}}, %left ], [ 7, %right ]
+; CHECK: %[[P:.*]] = phi i8 [ %x, %left ], [ 7, %right ]
+; CHECK: %[[P32:.*]] = zext i8 %[[P]] to i32
 ; CHECK-NOT: zext i8 %p to i32
-; CHECK: %[[Y32:.*]] = zext i8 %y to i32
-; CHECK: %[[CMP:.*]] = icmp ult i32 %[[P]], %[[Y32]]
-; CHECK: %[[SUM0:.*]] = add i32 %[[P]], %[[P]]
-; CHECK: %[[SUM1:.*]] = add i32 %[[P]], %[[P]]
+; CHECK: %[[CMP:.*]] = icmp ult i8 %[[P]], %y
+; CHECK: %[[SUM0:.*]] = add i32 %[[P32]], %[[P32]]
+; CHECK: %[[SUM1:.*]] = add i32 %[[P32]], %[[P32]]
 ; CHECK: %[[SUM:.*]] = add i32 %[[SUM0]], %[[SUM1]]
 ; CHECK: %[[SEL:.*]] = select i1 %[[CMP]], i32 %[[SUM]], i32 0
 ; CHECK: ret i32 %[[SEL]]
