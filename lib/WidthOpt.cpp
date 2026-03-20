@@ -986,6 +986,77 @@ static bool tryWidenPhiFromPlan(PHINode &Phi, const AnalysisResult &R,
   return false;
 }
 
+static bool tryWidenSelectFromPlan(SelectInst &Sel, const AnalysisResult &R,
+                                   const PlanResult &Plan) {
+  auto CompIt = R.ValueToComponent.find(&Sel);
+  if (CompIt == R.ValueToComponent.end())
+    return false;
+
+  const Component &C = R.Components[CompIt->second];
+  if (C.Fixed || C.Instructions.size() != 1 || C.Instructions.front() != &Sel)
+    return false;
+
+  unsigned OrigWidth = getValueWidth(&Sel);
+  unsigned TargetWidth = Plan.ChosenWidths[C.ID];
+  if (TargetWidth <= OrigWidth)
+    return false;
+
+  ExtKind Kind = ExtKind::None;
+  SmallVector<Instruction *, 8> ExtUsers;
+  for (User *U : Sel.users()) {
+    auto *I = dyn_cast<Instruction>(U);
+    if (!I)
+      return false;
+
+    ExtKind UserKind = ExtKind::None;
+    if (auto *Z = dyn_cast<ZExtInst>(I)) {
+      if (Z->getOperand(0) != &Sel || getValueWidth(Z) != TargetWidth)
+        return false;
+      UserKind = ExtKind::ZExt;
+    } else if (auto *S = dyn_cast<SExtInst>(I)) {
+      if (S->getOperand(0) != &Sel || getValueWidth(S) != TargetWidth)
+        return false;
+      UserKind = ExtKind::SExt;
+    } else {
+      return false;
+    }
+
+    if (Kind == ExtKind::None)
+      Kind = UserKind;
+    else if (Kind != UserKind)
+      return false;
+
+    ExtUsers.push_back(I);
+  }
+
+  if (Kind == ExtKind::None || ExtUsers.empty())
+    return false;
+
+  Value *WideTV =
+      materializeValueAtWidth(Sel.getTrueValue(), Kind, TargetWidth, &Sel);
+  Value *WideFV =
+      materializeValueAtWidth(Sel.getFalseValue(), Kind, TargetWidth, &Sel);
+
+  IRBuilder<> B(&Sel);
+  auto *WideSel =
+      cast<SelectInst>(B.CreateSelect(Sel.getCondition(), WideTV, WideFV, ""));
+  WideSel->setDebugLoc(Sel.getDebugLoc());
+  WideSel->takeName(&Sel);
+
+  for (Instruction *Ext : ExtUsers) {
+    Ext->replaceAllUsesWith(WideSel);
+    Ext->eraseFromParent();
+  }
+
+  if (Sel.use_empty()) {
+    Sel.eraseFromParent();
+    return true;
+  }
+
+  WideSel->eraseFromParent();
+  return false;
+}
+
 } // namespace
 
 WidthComponentAnalysis::Result
@@ -1146,14 +1217,23 @@ PreservedAnalyses WidthOptPass::run(Function &F, FunctionAnalysisManager &AM) {
   PlanResult Plan = computeWidthPlan(R);
 
   SmallVector<PHINode *, 16> PhiWidenWorklist;
+  SmallVector<SelectInst *, 16> SelectWidenWorklist;
   for (Instruction &I : instructions(F))
     if (auto *Phi = dyn_cast<PHINode>(&I))
       PhiWidenWorklist.push_back(Phi);
+    else if (auto *Sel = dyn_cast<SelectInst>(&I))
+      SelectWidenWorklist.push_back(Sel);
 
   for (PHINode *Phi : PhiWidenWorklist) {
     if (Phi->getParent() == nullptr)
       continue;
     Changed |= tryWidenPhiFromPlan(*Phi, R, Plan);
+  }
+
+  for (SelectInst *Sel : SelectWidenWorklist) {
+    if (Sel->getParent() == nullptr)
+      continue;
+    Changed |= tryWidenSelectFromPlan(*Sel, R, Plan);
   }
 
   if (!Changed)
