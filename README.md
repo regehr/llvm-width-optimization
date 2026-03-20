@@ -137,18 +137,24 @@ Example:
 
 ## Testing
 
-Run the plugin regression suite:
+Run the plugin regression suite directly:
 
 ```bash
 /Users/regehr/llvm-project/for-alive/bin/llvm-lit -sv \
   /Users/regehr/tmp/llvm-width-optimization-build/test
 ```
 
-Or, from a configured build tree, run the aggregate check target:
+From a configured build tree, run the single CMake test target:
 
 ```bash
 cmake --build /Users/regehr/tmp/llvm-width-optimization-build --target check
 ```
+
+`check` runs both:
+
+- the lit regression suite under `test/`
+- the smoke sweep that runs `width-opt` over every `.ll` file under `test/`
+  and reports crashes or hard failures
 
 Run the historical baseline harness after adding new external corpus files
 under `tests/`:

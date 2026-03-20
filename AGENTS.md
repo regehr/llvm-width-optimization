@@ -67,6 +67,8 @@ Follow the rules below unless the user explicitly overrides them.
 - Configure/build plugin:
   - `cmake -S /Users/regehr/llvm-width-optimization -B /tmp/llvm-width-optimization-build-fixpoint -DWO_LLVM_INSTALL_DIR=/Users/regehr/llvm-project/for-alive`
   - `cmake --build /tmp/llvm-width-optimization-build-fixpoint -j4`
+- Run the single CMake test target:
+  - `cmake --build /tmp/llvm-width-optimization-build-fixpoint --target check`
 - Run full lit:
   - `/Users/regehr/llvm-project/for-alive/bin/llvm-lit -sv /tmp/llvm-width-optimization-build-fixpoint/test`
 - Run Alive2 script with a specific plugin:
