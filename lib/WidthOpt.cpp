@@ -908,6 +908,9 @@ struct NarrowUDivResultPlan {
 bool tryNarrowUDivWithRange(BinaryOperator &BO, LazyValueInfo &LVI) {
   assert(BO.getOpcode() == Instruction::UDiv &&
          "UDiv narrowing expects a udiv instruction");
+  if (!isIntegerValue(&BO) || !isIntegerValue(BO.getOperand(0)) ||
+      !isIntegerValue(BO.getOperand(1)))
+    return false;
 
   unsigned OrigWidth = getValueWidth(&BO);
   unsigned LHSWidth = getUnsignedRangeWidth(BO.getOperandUse(0), LVI);
@@ -1074,11 +1077,15 @@ bool canWidenAddOperandWithoutOverflow(const ExtOperandInfo &ExtInfo,
 bool tryWidenAddThroughZExt(BinaryOperator &BO) {
   assert(BO.getOpcode() == Instruction::Add &&
          "Add widening expects an add instruction");
+  if (!isIntegerValue(&BO))
+    return false;
   if (!BO.hasOneUse())
     return false;
 
   auto *WideZ = dyn_cast<ZExtInst>(*BO.user_begin());
   if (!WideZ)
+    return false;
+  if (!isIntegerValue(WideZ))
     return false;
 
   unsigned WideWidth = getValueWidth(WideZ);
