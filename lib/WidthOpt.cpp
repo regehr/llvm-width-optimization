@@ -897,6 +897,103 @@ bool tryShrinkTruncOfAdd(TruncInst &Tr) {
   return true;
 }
 
+Value *materializeTruncRootedValueAtWidth(Value *V, unsigned TargetWidth,
+                                          Instruction *InsertBefore,
+                                          DenseMap<Value *, Value *> *Cache =
+                                              nullptr) {
+  if (!isIntegerValue(V))
+    return nullptr;
+
+  if (Cache)
+    if (Value *Cached = Cache->lookup(V))
+      return Cached;
+
+  unsigned Width = getValueWidth(V);
+  auto *TargetTy = IntegerType::get(V->getContext(), TargetWidth);
+  if (Width == TargetWidth) {
+    if (Cache)
+      (*Cache)[V] = V;
+    return V;
+  }
+
+  if (auto Ext = getExtOperandInfo(V)) {
+    if (TargetWidth < Ext->NarrowWidth || TargetWidth > Ext->WideWidth)
+      return nullptr;
+    IRBuilder<> B(InsertBefore);
+    Value *Result = materializeAtWidth(B, *Ext, TargetWidth);
+    if (Cache && Result)
+      (*Cache)[V] = Result;
+    return Result;
+  }
+
+  if (auto *C = dyn_cast<ConstantInt>(V)) {
+    Value *Result = ConstantInt::get(TargetTy, C->getValue().trunc(TargetWidth));
+    if (Cache)
+      (*Cache)[V] = Result;
+    return Result;
+  }
+
+  if (auto *BO = dyn_cast<BinaryOperator>(V)) {
+    if (BO->getOpcode() != Instruction::Sub)
+      return nullptr;
+    auto *Zero = dyn_cast<ConstantInt>(BO->getOperand(0));
+    if (!Zero || !Zero->isZero())
+      return nullptr;
+    Value *NarrowRHS =
+        materializeTruncRootedValueAtWidth(BO->getOperand(1), TargetWidth,
+                                           InsertBefore, Cache);
+    if (!NarrowRHS)
+      return nullptr;
+    IRBuilder<> B(InsertBefore);
+    Value *Result = B.CreateSub(ConstantInt::get(TargetTy, 0), NarrowRHS);
+    if (Cache && Result)
+      (*Cache)[V] = Result;
+    return Result;
+  }
+
+  if (Width > TargetWidth) {
+    IRBuilder<> B(InsertBefore);
+    Value *Result = B.CreateTrunc(V, TargetTy);
+    if (Cache && Result)
+      (*Cache)[V] = Result;
+    return Result;
+  }
+
+  return nullptr;
+}
+
+bool tryShrinkTruncOfSelect(TruncInst &Tr) {
+  auto *Sel = dyn_cast<SelectInst>(Tr.getOperand(0));
+  if (!Sel || !Sel->hasOneUse())
+    return false;
+
+  unsigned TargetWidth = getValueWidth(&Tr);
+  unsigned SourceWidth = getValueWidth(Sel);
+  if (TargetWidth >= SourceWidth)
+    return false;
+
+  DenseMap<Value *, Value *> Cache;
+  Value *NarrowTV =
+      materializeTruncRootedValueAtWidth(Sel->getTrueValue(), TargetWidth, &Tr,
+                                         &Cache);
+  Value *NarrowFV = materializeTruncRootedValueAtWidth(Sel->getFalseValue(),
+                                                       TargetWidth, &Tr, &Cache);
+  if (!NarrowTV || !NarrowFV)
+    return false;
+
+  IRBuilder<> B(&Tr);
+  auto *NarrowSel = cast<SelectInst>(
+      B.CreateSelect(Sel->getCondition(), NarrowTV, NarrowFV, Tr.getName()));
+  NarrowSel->setDebugLoc(Tr.getDebugLoc());
+  Tr.replaceAllUsesWith(NarrowSel);
+  Tr.eraseFromParent();
+
+  if (Sel->use_empty())
+    RecursivelyDeleteTriviallyDeadInstructions(Sel);
+
+  return true;
+}
+
 bool tryPushFreezeThroughExt(FreezeInst &FI) {
   // Canonicalize freeze(ext x) into ext(freeze x) for simple integer casts.
   // This follows the safe direction used by InstCombine: the cast only
@@ -1727,6 +1824,10 @@ PreservedAnalyses WidthOptPass::run(Function &F, FunctionAnalysisManager &AM) {
   for (TruncInst *Tr : Truncs) {
     if (Tr->getParent() == nullptr)
       continue;
+    if (tryShrinkTruncOfSelect(*Tr)) {
+      Changed = true;
+      continue;
+    }
     Changed |= tryShrinkTruncOfAdd(*Tr);
   }
 
