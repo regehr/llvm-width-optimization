@@ -39,6 +39,7 @@ Implemented today:
 - local `icmp` + `select` to min/max canonicalization
 - local `phi` and `select` shrinking for `zext`/`sext` inputs plus fitting
   constants, including mixed narrow widths through a common intermediate width
+  plus direct repair of trunc and zero-compare users from narrowed selects
 - `sext` to `zext nneg` when `LazyValueInfo` proves a non-negative operand
 - demanded-bits-style `sext` to `zext nneg`, including a shared multi-use case
 - widening of `icmp eq/ne` over matching `trunc`s when known bits justify it

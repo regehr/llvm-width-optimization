@@ -390,6 +390,52 @@ Value *materializeAtWidth(IRBuilder<> &B, const ExtOperandInfo &Info,
   llvm_unreachable("Unexpected extension kind");
 }
 
+std::optional<ICmpInst::Predicate>
+getNarrowPredicateForZeroCompare(ICmpInst::Predicate Pred, ExtKind Kind) {
+  if (Kind == ExtKind::SExt) {
+    if (isEqOrNe(Pred) || isSignedICmp(Pred))
+      return Pred;
+    return std::nullopt;
+  }
+
+  if (Kind != ExtKind::ZExt)
+    return std::nullopt;
+
+  switch (Pred) {
+  case ICmpInst::ICMP_EQ:
+    return ICmpInst::ICMP_EQ;
+  case ICmpInst::ICMP_NE:
+    return ICmpInst::ICMP_NE;
+  case ICmpInst::ICMP_UGT:
+  case ICmpInst::ICMP_SGT:
+    return ICmpInst::ICMP_NE;
+  case ICmpInst::ICMP_ULE:
+  case ICmpInst::ICMP_SLE:
+    return ICmpInst::ICMP_EQ;
+  default:
+    return std::nullopt;
+  }
+}
+
+std::optional<ICmpInst::Predicate>
+getRetargetedZeroComparePredicate(ICmpInst &Cmp, Value &WideV, ExtKind Kind,
+                                  unsigned WideWidth) {
+  unsigned WideIdx = 0;
+  if (Cmp.getOperand(1) == &WideV)
+    WideIdx = 1;
+  else if (Cmp.getOperand(0) != &WideV)
+    return std::nullopt;
+
+  auto *C = dyn_cast<ConstantInt>(Cmp.getOperand(1 - WideIdx));
+  if (!C || C->getBitWidth() != WideWidth || !C->isZero())
+    return std::nullopt;
+
+  ICmpInst::Predicate Pred = Cmp.getPredicate();
+  if (WideIdx == 1)
+    Pred = Cmp.getSwappedPredicate();
+  return getNarrowPredicateForZeroCompare(Pred, Kind);
+}
+
 bool tryShrinkICmp(ICmpInst &Cmp) {
   auto LHSInfo = getExtOperandInfo(Cmp.getOperand(0));
   auto RHSInfo = getExtOperandInfo(Cmp.getOperand(1));
@@ -791,6 +837,26 @@ bool tryShrinkSelectOfExts(SelectInst &Sel) {
   if (FalseC && !canRepresentConstant(*FalseC, Info.Kind, Info.NarrowWidth))
     return false;
 
+  SmallVector<Instruction *, 8> OriginalUsers;
+  bool NeedWideResult = false;
+  for (User *U : Sel.users()) {
+    auto *UserI = dyn_cast<Instruction>(U);
+    if (!UserI)
+      return false;
+    OriginalUsers.push_back(UserI);
+
+    if (auto *Tr = dyn_cast<TruncInst>(UserI))
+      if (Tr->getOperand(0) == &Sel && getValueWidth(Tr) == Info.NarrowWidth)
+        continue;
+
+    if (auto *Cmp = dyn_cast<ICmpInst>(UserI))
+      if (getRetargetedZeroComparePredicate(*Cmp, Sel, Info.Kind,
+                                            Info.WideWidth))
+        continue;
+
+    NeedWideResult = true;
+  }
+
   unsigned RemovableExts = 0;
   if (TrueExt && TrueExt->Producer->hasOneUse())
     ++RemovableExts;
@@ -798,7 +864,7 @@ bool tryShrinkSelectOfExts(SelectInst &Sel) {
       FalseExt->Producer != (TrueExt ? TrueExt->Producer : nullptr))
     ++RemovableExts;
 
-  unsigned AddedExts = 1;
+  unsigned AddedExts = NeedWideResult ? 1 : 0;
   if (TrueExt && TrueExt->NarrowWidth != Info.NarrowWidth &&
       !isa<Constant>(TrueExt->NarrowValue))
     ++AddedExts;
@@ -822,13 +888,47 @@ bool tryShrinkSelectOfExts(SelectInst &Sel) {
   auto *NarrowSel = cast<SelectInst>(
       B.CreateSelect(Sel.getCondition(), NarrowTV, NarrowFV,
                      Sel.getName() + ".narrow"));
-  Instruction *Wide = nullptr;
-  if (Info.Kind == ExtKind::ZExt)
-    Wide = cast<Instruction>(B.CreateZExt(NarrowSel, WideTy, Sel.getName()));
-  else
-    Wide = cast<Instruction>(B.CreateSExt(NarrowSel, WideTy, Sel.getName()));
+  SmallVector<Instruction *, 8> RemainingWideUsers;
+  for (Instruction *UserI : OriginalUsers) {
+    if (auto *Tr = dyn_cast<TruncInst>(UserI)) {
+      if (Tr->getOperand(0) == &Sel && getValueWidth(Tr) == Info.NarrowWidth) {
+        Tr->replaceAllUsesWith(NarrowSel);
+        Tr->eraseFromParent();
+        continue;
+      }
+    }
 
-  Sel.replaceAllUsesWith(Wide);
+    if (auto *Cmp = dyn_cast<ICmpInst>(UserI)) {
+      auto NarrowPred = getRetargetedZeroComparePredicate(*Cmp, Sel, Info.Kind,
+                                                          Info.WideWidth);
+      if (NarrowPred) {
+        IRBuilder<> CmpB(Cmp);
+        auto *Zero = ConstantInt::get(IntegerType::get(Cmp->getContext(),
+                                                       Info.NarrowWidth), 0);
+        auto *NewCmp =
+            cast<ICmpInst>(CmpB.CreateICmp(*NarrowPred, NarrowSel, Zero,
+                                           Cmp->getName()));
+        NewCmp->setDebugLoc(Cmp->getDebugLoc());
+        Cmp->replaceAllUsesWith(NewCmp);
+        Cmp->eraseFromParent();
+        continue;
+      }
+    }
+
+    RemainingWideUsers.push_back(UserI);
+  }
+
+  if (!RemainingWideUsers.empty()) {
+    Instruction *Wide = nullptr;
+    if (Info.Kind == ExtKind::ZExt)
+      Wide = cast<Instruction>(B.CreateZExt(NarrowSel, WideTy, Sel.getName()));
+    else
+      Wide = cast<Instruction>(B.CreateSExt(NarrowSel, WideTy, Sel.getName()));
+
+    for (Instruction *UserI : RemainingWideUsers)
+      UserI->replaceUsesOfWith(&Sel, Wide);
+  }
+
   Sel.eraseFromParent();
 
   if (TrueExt && TrueExt->Producer->use_empty())

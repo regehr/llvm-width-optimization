@@ -53,7 +53,8 @@ currently comes from targeted local rewrites that complement the planner.
 - `phi` shrinking for `zext` or `sext` inputs plus fitting constants,
   including mixed narrow widths through a common intermediate width
 - `select` shrinking for `zext` or `sext` arms plus fitting constants,
-  including mixed narrow widths through a common intermediate width
+  including mixed narrow widths through a common intermediate width and direct
+  repair of trunc/zero-compare users from the narrowed select
 - freeze-aware compare shrinking via `freeze(cast x) -> cast(freeze x)`
 - `sext` to `zext nneg` when `LazyValueInfo` proves the operand non-negative
 - demanded-bits-style `sext` to `zext nneg`
@@ -238,7 +239,7 @@ proof and regression discipline.
   and `test/width-opt-icmp-ult-shared-trunc-no-increase.ll`.
 - relax shared-extension merge handling so the pass keeps up with LLVM on the
   remaining conditional-dataflow case
-  Current oracle losses: `test/width-opt-select-shared-ext-no-increase.ll`.
+  Current oracle losses: `test/width-opt-select-shared-ext-user-repair.ll`.
 - strengthen trunc-rooted arithmetic handling where shared wide operands still
   block profitable narrowing
   Current oracle losses: `test/width-opt-trunc-add-wide-operands-no-increase.ll`.

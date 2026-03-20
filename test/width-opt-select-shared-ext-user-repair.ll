@@ -1,10 +1,10 @@
-; A select-of-exts rewrite should be driven by removable extension
-; instructions. If the surviving wide uses would require adding a new result
-; extension but the arm extension is still shared, leave the select alone.
+; Shared arm extensions should not block select shrinking when all wide users
+; of the select can be repaired directly from the narrow value.
 ; RUN: opt -load-pass-plugin %shlibdir/libWidthOpt%shlibext \
 ; RUN:   -passes='width-opt' -S %s | FileCheck %s
 
-define i1 @select_no_increase_shared_zext(i2 %arg0, i2 %arg1, i1 %arg2, i2 %arg3) {
+define i1 @select_shared_zext_user_repair(i2 %arg0, i2 %arg1, i1 %arg2,
+                                          i2 %arg3) {
 entry:
   %cmp0 = icmp sgt i2 0, %arg0
   %zext = zext i1 %arg2 to i2
@@ -24,9 +24,11 @@ entry:
   ret i1 %lshr
 }
 
-; CHECK-LABEL: define i1 @select_no_increase_shared_zext(
+; CHECK-LABEL: define i1 @select_shared_zext_user_repair(
 ; CHECK: %zext = zext i1 %arg2 to i2
-; CHECK: %sel0 = select i1 %cmp0, i2 0, i2 %zext
-; CHECK: %trunc = trunc i2 %sel0 to i1
-; CHECK: %cmp4 = icmp sgt i2 %sel0, 0
-; CHECK-NOT: select i1 %cmp0, i1 false, i1 %arg2
+; CHECK: %[[SEL:.*]] = select i1 %cmp0, i1 false, i1 %arg2
+; CHECK-NOT: trunc i2
+; CHECK: %sel1 = select i1 %[[SEL]], i2 %arg1, i2 0
+; CHECK: %cmp1 = icmp sle i1 %cmp0, %[[SEL]]
+; CHECK: icmp ne i1 %[[SEL]], false
+; CHECK-NOT: zext i1 %[[SEL]] to i2
