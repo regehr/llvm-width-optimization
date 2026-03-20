@@ -288,6 +288,9 @@ unsigned computeShrinkWidth(ICmpInst::Predicate Pred, const ExtOperandInfo &LHS,
   if (LHS.WideWidth != RHS.WideWidth)
     return 0;
 
+  // Same-kind extension pairs are the easy cases: equality is preserved by
+  // either extension kind, and signed/unsigned order is preserved by the
+  // matching signedness-preserving extension.
   if (LHS.Kind == ExtKind::ZExt && RHS.Kind == ExtKind::ZExt) {
     if (isEqOrNe(Pred) || isUnsignedICmp(Pred))
       return std::max(LHS.NarrowWidth, RHS.NarrowWidth);
@@ -306,6 +309,9 @@ unsigned computeShrinkWidth(ICmpInst::Predicate Pred, const ExtOperandInfo &LHS,
   if (!isSignedICmp(Pred))
     return 0;
 
+  // Mixed signed/unsigned extension pairs need one extra bit on the zero-
+  // extended side so the narrowed compare can still distinguish all
+  // non-negative values from the negative signed range.
   if (LHS.Kind == ExtKind::SExt && RHS.Kind == ExtKind::ZExt)
     return std::max(LHS.NarrowWidth, RHS.NarrowWidth + 1);
 
@@ -420,6 +426,10 @@ bool tryWidenTruncZeroExtendedICmp(ICmpInst &Cmp, const DataLayout &DL,
   if (!isEqOrNe(Cmp.getPredicate()) && !isUnsignedICmp(Cmp.getPredicate()))
     return false;
 
+  // This is intentionally asymmetric. We allow one operand to stay wide when
+  // its truncated-away high bits are known zero, then zero-extend the other
+  // side to meet it. That captures the common "trunc vs narrow" compare
+  // patterns without requiring both operands to share the same shape.
   auto tryOneDirection = [&](unsigned TruncIdx) -> bool {
     auto *Tr = dyn_cast<TruncInst>(Cmp.getOperand(TruncIdx));
     if (!Tr)
@@ -728,6 +738,9 @@ bool tryConvertSExtToNonNegZExt(SExtInst &Ext, LazyValueInfo &LVI) {
   if (!LVI.getConstantRangeAtUse(Base, /*UndefAllowed=*/false).isAllNonNegative())
     return false;
 
+  // Once the operand is known non-negative at this use, sign extension and
+  // zero extension agree. Mark the replacement non-negative as well so later
+  // folds can continue to exploit that fact.
   auto *ZExt = CastInst::CreateZExtOrBitCast(Base, Ext.getType(), "",
                                              Ext.getIterator());
   ZExt->takeName(&Ext);
@@ -801,6 +814,9 @@ bool tryConvertWholeSExtToZExt(SExtInst &Ext) {
   if (Ext.use_empty())
     return false;
 
+  // This is the shared-value variant of the masked-use fold above. Only weaken
+  // the defining sext when every use is compatible with zero-extension
+  // semantics; otherwise keep the single shared sext.
   for (User *U : Ext.users())
     if (!sextUseAllowsZExt(*U, Ext))
       return false;
@@ -839,6 +855,8 @@ bool tryNarrowUDivWithRange(BinaryOperator &BO, LazyValueInfo &LVI) {
   if (TargetWidth >= OrigWidth)
     return false;
 
+  // For unsigned division, proving both operands fit in a smaller width is
+  // enough to run the division there and zero-extend the quotient back.
   IRBuilder<> B(&BO);
   auto *TargetTy = IntegerType::get(BO.getContext(), TargetWidth);
   Value *NarrowLHS = B.CreateTrunc(BO.getOperand(0), TargetTy);
@@ -870,6 +888,9 @@ bool canWidenAddOperandWithoutOverflow(const ExtOperandInfo &ExtInfo,
   if (ExtInfo.Kind != ExtKind::ZExt)
     return false;
 
+  // Require the narrow operand's maximal zero-extended value plus the constant
+  // to stay within the intermediate width. That lets us bypass the narrower
+  // add without changing modulo arithmetic.
   unsigned MidWidth = ExtInfo.WideWidth;
   APInt Max = APInt::getLowBitsSet(MidWidth, ExtInfo.NarrowWidth).zext(MidWidth);
   APInt Sum = Max + C.getValue().zextOrTrunc(MidWidth);
@@ -891,6 +912,9 @@ bool tryWidenAddThroughZExt(BinaryOperator &BO) {
   if (BO.hasNoUnsignedWrap() || BO.hasNoSignedWrap())
     return false;
 
+  // This is a narrow local widening pattern: if one operand already comes from
+  // a zext and the result is immediately zext'ed again, try to reuse an
+  // existing wider path and do the add there instead.
   auto trySide = [&](unsigned ExtIdx, unsigned OtherIdx) -> bool {
     auto ExtInfo = getExtOperandInfo(BO.getOperand(ExtIdx));
     auto *C = dyn_cast<ConstantInt>(BO.getOperand(OtherIdx));
@@ -1015,6 +1039,9 @@ Value *materializeTruncRootedValueAtWidth(Value *V, unsigned TargetWidth,
                                           Instruction *InsertBefore,
                                           DenseMap<Value *, Value *> *Cache =
                                               nullptr) {
+  // This helper is intentionally tiny. It rebuilds only the narrow patterns we
+  // currently know how to prove under a final truncation, and otherwise lets
+  // the caller give up instead of speculating about general arithmetic.
   if (!isIntegerValue(V))
     return nullptr;
 
@@ -1086,6 +1113,9 @@ bool tryShrinkTruncOfSelect(TruncInst &Tr) {
   if (TargetWidth >= SourceWidth)
     return false;
 
+  // Materialize each arm at the truncated width first, then rebuild the select
+  // directly in that type. The small cache keeps shared arm structure shared
+  // after rewriting.
   DenseMap<Value *, Value *> Cache;
   Value *NarrowTV =
       materializeTruncRootedValueAtWidth(Sel->getTrueValue(), TargetWidth, &Tr,
@@ -1415,6 +1445,10 @@ PlanResult computeWidthPlan(const AnalysisResult &R) {
       break;
   }
 
+  // The current planner is a small local-improvement heuristic over the
+  // component graph, not the eventual exact binary solver described in the
+  // design document. Keep the reported total cost in the same cost model the
+  // chooser used so debug output stays interpretable.
   for (const ComponentEdge &E : R.Edges)
     Plan.TotalCutCost +=
         edgeCutCost(Plan.ChosenWidths[E.From], Plan.ChosenWidths[E.To]);
@@ -1490,6 +1524,8 @@ AnalysisResult computeWidthComponents(Function &F) {
   DenseSet<uint64_t> SeenEdges;
   DenseSet<uint64_t> SeenCompareAffinities;
   for (Instruction &I : instructions(F)) {
+    // Ordinary cross-component def-use edges become cut candidates in the
+    // planner: differing chosen widths here imply a boundary conversion.
     for (Value *Op : I.operands()) {
       if (!shouldTrackValue(Op))
         continue;
@@ -1505,6 +1541,9 @@ AnalysisResult computeWidthComponents(Function &F) {
     }
 
     if (auto *Cmp = dyn_cast<ICmpInst>(&I)) {
+      // Compare operands do not merge into one component because the result is
+      // i1, but the compare still prefers them to agree on width. Record that
+      // separately from the ordinary def-use graph.
       Value *LHS = Cmp->getOperand(0);
       Value *RHS = Cmp->getOperand(1);
       if (shouldTrackValue(LHS) && shouldTrackValue(RHS)) {
@@ -1550,6 +1589,9 @@ bool tryRetargetExternalICmp(ICmpInst &Cmp, const DenseSet<const Value *> &Compo
   if (!canRetargetBoundaryCompare(Cmp.getPredicate(), InternalKind))
     return false;
 
+  // Retarget the compare itself when the widened internal representation
+  // already matches the predicate's semantics. This is cheaper than truncating
+  // the widened value back to OrigWidth just to rebuild the compare as-is.
   Value *NewOps[2] = {nullptr, nullptr};
   for (unsigned Idx = 0; Idx != 2; ++Idx) {
     Value *Op = Cmp.getOperand(Idx);
@@ -1645,6 +1687,8 @@ bool tryWidenComponentFromPlan(const Component &C, const AnalysisResult &R,
     }
   }
 
+  // The current region widener is consumer-driven: it only widens when there
+  // is some external pressure at the chosen target width to absorb.
   if (ExternalUsers.empty())
     return false;
 
@@ -1989,8 +2033,9 @@ PreservedAnalyses WidthOptPass::run(Function &F, FunctionAnalysisManager &AM) {
 
   bool Changed = false;
 
-  // Run small local canonicalizations first. They simplify the IR, improve the
-  // candidate-width graph, and expose cleaner regions for the global planner.
+  // Run local rewrites first. They do most of the current narrowing work,
+  // simplify the IR seen by component analysis, and expose cleaner widening
+  // opportunities for the plan-driven phase at the end of the pass.
   for (BinaryOperator *Add : Adds) {
     if (Add->getParent() == nullptr)
       continue;
