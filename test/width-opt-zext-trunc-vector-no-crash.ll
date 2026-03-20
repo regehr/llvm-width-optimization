@@ -1,5 +1,5 @@
-; Vector zext(trunc(x)) patterns are outside the current scalar mask-folding
-; logic. The pass should leave them alone rather than crashing.
+; Fixed-vector zext(trunc(x)) patterns can use the same low-bit mask fold as
+; scalars.
 ; RUN: opt -load-pass-plugin %shlibdir/libWidthOpt%shlibext \
 ; RUN:   -passes='width-opt' -S %s | FileCheck %s
 
@@ -11,6 +11,6 @@ entry:
 }
 
 ; CHECK-LABEL: define <2 x i65> @foo(
-; CHECK: %[[A:.*]] = trunc <2 x i64> %t to <2 x i32>
-; CHECK: %[[B:.*]] = zext <2 x i32> %[[A]] to <2 x i65>
+; CHECK: %[[MASK:.*]] = and <2 x i64> %t, splat (i64 4294967295)
+; CHECK: %[[B:.*]] = zext <2 x i64> %[[MASK]] to <2 x i65>
 ; CHECK: ret <2 x i65> %[[B]]

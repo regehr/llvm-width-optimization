@@ -5,6 +5,12 @@ reasoning behind it. When it differs from the current implementation,
 [README.md](./README.md) is the source of truth for prototype status,
 supported transforms, and near-term engineering priorities.
 
+Mandatory scope rule: this project exists to remove `sext`, `zext`, and
+`trunc` within `WidthOpt` itself. Running or relying on unrelated general
+cleanup passes such as `InstSimplify`, `InstCombine`, or
+`AggressiveInstCombine` is not a valid solution; those are comparison or
+debugging tools only.
+
 ## Goal
 
 Design an LLVM pass that reduces the number of integer width-changing instructions in a function, such as `zext`, `sext`, and `trunc`, while preserving semantics.
@@ -47,9 +53,10 @@ Implemented today:
   known zero
 - local folding of `trunc(sext(x))` or `trunc(zext(x))` back to the original
   source width or a narrower trunc of that source
-- local `zext(trunc(x))` to mask formation
+- local `zext(trunc(x))` to mask formation, including fixed integer vectors
 - trunc-rooted shrinking for selected `add`, `select`, and shift-recurrence
-  patterns
+  patterns, including recursive rebuilding through low-bit-preserving
+  `add/sub/mul/and/or/xor` structure under a root trunc
 - range-driven `udiv` narrowing
 - local widening of a `zext -> add -> zext` chain into a reused wider path
 - plan-driven widening of small width-polymorphic components

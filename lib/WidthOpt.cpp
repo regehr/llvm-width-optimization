@@ -70,8 +70,56 @@ IntegerType *getIntegerTy(Value *V) {
   return dyn_cast<IntegerType>(V->getType());
 }
 
+IntegerType *getScalarIntegerTy(Type *Ty) {
+  if (auto *IT = dyn_cast<IntegerType>(Ty))
+    return IT;
+  if (auto *VT = dyn_cast<FixedVectorType>(Ty))
+    return dyn_cast<IntegerType>(VT->getElementType());
+  return nullptr;
+}
+
+IntegerType *getScalarIntegerTy(Value *V) {
+  return getScalarIntegerTy(V->getType());
+}
+
 bool isIntegerValue(Value *V) {
   return getIntegerTy(V) != nullptr;
+}
+
+bool isScalarOrFixedVectorIntegerValue(Value *V) {
+  return getScalarIntegerTy(V) != nullptr;
+}
+
+bool haveSameIntegerShape(Type *A, Type *B) {
+  auto *AI = dyn_cast<IntegerType>(A);
+  auto *BI = dyn_cast<IntegerType>(B);
+  if (AI || BI)
+    return AI != nullptr && BI != nullptr;
+
+  auto *AV = dyn_cast<FixedVectorType>(A);
+  auto *BV = dyn_cast<FixedVectorType>(B);
+  return AV != nullptr && BV != nullptr &&
+         isa<IntegerType>(AV->getElementType()) &&
+         isa<IntegerType>(BV->getElementType()) &&
+         AV->getNumElements() == BV->getNumElements();
+}
+
+unsigned getScalarIntegerWidth(Type *Ty) {
+  auto *IT = getScalarIntegerTy(Ty);
+  assert(IT && "Expected scalar integer or fixed integer vector type");
+  return IT->getBitWidth();
+}
+
+Constant *getLowBitsMaskConstant(Type *Ty, unsigned NarrowWidth) {
+  auto *EltTy = getScalarIntegerTy(Ty);
+  assert(EltTy && "Expected scalar integer or fixed integer vector type");
+  APInt Mask = APInt::getLowBitsSet(EltTy->getBitWidth(), NarrowWidth);
+  if (auto *IT = dyn_cast<IntegerType>(Ty))
+    return ConstantInt::get(IT, Mask);
+
+  auto *VT = cast<FixedVectorType>(Ty);
+  return ConstantVector::getSplat(VT->getElementCount(),
+                                  ConstantInt::get(EltTy, Mask));
 }
 
 void unionIfRetargetable(EquivalenceClasses<const Value *> &EC, Value *A,
@@ -1368,14 +1416,19 @@ bool tryFoldZExtOfTruncToMask(ZExtInst &Ext) {
   auto *Tr = dyn_cast<TruncInst>(Ext.getOperand(0));
   if (!Tr)
     return false;
-  if (!isIntegerValue(&Ext) || !isIntegerValue(Tr) ||
-      !isIntegerValue(Tr->getOperand(0)))
+  if (!isScalarOrFixedVectorIntegerValue(&Ext) ||
+      !isScalarOrFixedVectorIntegerValue(Tr) ||
+      !isScalarOrFixedVectorIntegerValue(Tr->getOperand(0)))
     return false;
 
   Value *Src = Tr->getOperand(0);
-  unsigned SrcWidth = getValueWidth(Src);
-  unsigned NarrowWidth = getValueWidth(Tr);
-  unsigned WideWidth = getValueWidth(&Ext);
+  if (!haveSameIntegerShape(Src->getType(), Tr->getType()) ||
+      !haveSameIntegerShape(Src->getType(), Ext.getType()))
+    return false;
+
+  unsigned SrcWidth = getScalarIntegerWidth(Src->getType());
+  unsigned NarrowWidth = getScalarIntegerWidth(Tr->getType());
+  unsigned WideWidth = getScalarIntegerWidth(Ext.getType());
   assert(NarrowWidth < WideWidth &&
          "ZExt results must be wider than their truncated operand");
 
@@ -1389,12 +1442,12 @@ bool tryFoldZExtOfTruncToMask(ZExtInst &Ext) {
   if (SrcWidth >= WideWidth) {
     Value *Base = Src;
     if (SrcWidth != WideWidth)
-      Base = B.CreateTrunc(Src, IntegerType::get(Ext.getContext(), WideWidth));
-    APInt Mask = APInt::getLowBitsSet(WideWidth, NarrowWidth);
-    Masked = B.CreateAnd(Base, ConstantInt::get(Base->getType(), Mask));
+      Base = B.CreateTrunc(Src, Ext.getType());
+    Masked = B.CreateAnd(Base, getLowBitsMaskConstant(Base->getType(),
+                                                      NarrowWidth));
   } else {
-    APInt Mask = APInt::getLowBitsSet(SrcWidth, NarrowWidth);
-    Value *Narrowed = B.CreateAnd(Src, ConstantInt::get(Src->getType(), Mask));
+    Value *Narrowed =
+        B.CreateAnd(Src, getLowBitsMaskConstant(Src->getType(), NarrowWidth));
     Masked = B.CreateZExt(Narrowed, Ext.getType());
   }
 
@@ -1444,6 +1497,18 @@ bool tryFoldTruncOfExt(TruncInst &Tr) {
   return true;
 }
 
+bool isTruncRootedLowBitsPreservingOpcode(unsigned Opcode);
+
+Value *materializeTruncRootedValueAtWidth(Value *V, unsigned TargetWidth,
+                                          Instruction *InsertBefore,
+                                          DenseMap<Value *, Value *> *Cache =
+                                              nullptr);
+
+bool collectTruncRootedValueCost(
+    Value *V, unsigned TargetWidth, SmallPtrSetImpl<Value *> &AddedValues,
+    SmallPtrSetImpl<Instruction *> &RemovedInstructions,
+    SmallPtrSetImpl<Value *> &Visited);
+
 bool tryShrinkTruncOfAdd(TruncInst &Tr) {
   auto *BO = dyn_cast<BinaryOperator>(Tr.getOperand(0));
   if (!BO || BO->getOpcode() != Instruction::Add || !BO->hasOneUse())
@@ -1458,49 +1523,34 @@ bool tryShrinkTruncOfAdd(TruncInst &Tr) {
   assert(TargetWidth < SourceWidth &&
          "Trunc results must be narrower than their source");
 
-  unsigned AddedBoundaryCost = 0;
-  unsigned RemovedBoundaryCost = 1; // The root trunc always disappears.
-  auto assessOperand = [&](Value *V) {
-    if (auto Ext = getExtOperandInfo(V)) {
-      if (Ext->NarrowWidth == TargetWidth && Ext->Producer->hasOneUse())
-        ++RemovedBoundaryCost;
-      return;
-    }
-    if (isa<ConstantInt>(V))
-      return;
-    ++AddedBoundaryCost;
-  };
-  assessOperand(BO->getOperand(0));
-  assessOperand(BO->getOperand(1));
-
-  // Rebuild the add at the narrow width only when removable boundary
-  // instructions around the region pay for any new operand truncations.
-  if (AddedBoundaryCost > RemovedBoundaryCost)
+  SmallPtrSet<Value *, 8> AddedValues;
+  SmallPtrSet<Instruction *, 8> RemovedInstructions;
+  SmallPtrSet<Value *, 8> VisitedValues;
+  if (!collectTruncRootedValueCost(BO->getOperand(0), TargetWidth, AddedValues,
+                                   RemovedInstructions, VisitedValues) ||
+      !collectTruncRootedValueCost(BO->getOperand(1), TargetWidth, AddedValues,
+                                   RemovedInstructions, VisitedValues))
     return false;
 
-  IRBuilder<> B(&Tr);
-  auto *TargetTy = IntegerType::get(Tr.getContext(), TargetWidth);
-  auto materializeOperand = [&](Value *V) -> Value * {
-    assert(isIntegerValue(V) && "Trunc-rooted add operands should be integers");
-    unsigned W = getValueWidth(V);
-    (void)W;
-    assert(W != TargetWidth &&
-           "Add operands stay at the source width until rebuilt");
-    if (auto Ext = getExtOperandInfo(V))
-      if (Ext->NarrowWidth == TargetWidth)
-        return Ext->NarrowValue;
-    if (auto *C = dyn_cast<ConstantInt>(V))
-      return ConstantInt::get(TargetTy, C->getValue().trunc(TargetWidth));
-    assert(W > TargetWidth &&
-           "Remaining add operands should still be wider than the target");
-    return B.CreateTrunc(V, TargetTy);
-  };
+  unsigned AddedInstructionCost = AddedValues.size();
+  unsigned RemovedInstructionCost = 1 + RemovedInstructions.size();
 
-  Value *LHS = materializeOperand(BO->getOperand(0));
-  Value *RHS = materializeOperand(BO->getOperand(1));
+  // Rebuild the add at the narrow width only when removable instructions
+  // around the region pay for any recursive narrowing we introduce.
+  if (AddedInstructionCost > RemovedInstructionCost)
+    return false;
+
+  DenseMap<Value *, Value *> Cache;
+  Value *LHS =
+      materializeTruncRootedValueAtWidth(BO->getOperand(0), TargetWidth, &Tr,
+                                         &Cache);
+  Value *RHS =
+      materializeTruncRootedValueAtWidth(BO->getOperand(1), TargetWidth, &Tr,
+                                         &Cache);
   if (!LHS || !RHS)
     return false;
 
+  IRBuilder<> B(&Tr);
   auto *NewAdd = cast<Instruction>(B.CreateAdd(LHS, RHS, Tr.getName()));
   NewAdd->setDebugLoc(Tr.getDebugLoc());
   Tr.replaceAllUsesWith(NewAdd);
@@ -1512,10 +1562,23 @@ bool tryShrinkTruncOfAdd(TruncInst &Tr) {
   return true;
 }
 
+bool isTruncRootedLowBitsPreservingOpcode(unsigned Opcode) {
+  switch (Opcode) {
+  case Instruction::Add:
+  case Instruction::Sub:
+  case Instruction::Mul:
+  case Instruction::And:
+  case Instruction::Or:
+  case Instruction::Xor:
+    return true;
+  default:
+    return false;
+  }
+}
+
 Value *materializeTruncRootedValueAtWidth(Value *V, unsigned TargetWidth,
                                           Instruction *InsertBefore,
-                                          DenseMap<Value *, Value *> *Cache =
-                                              nullptr) {
+                                          DenseMap<Value *, Value *> *Cache) {
   // This helper is intentionally tiny. It rebuilds only the narrow patterns we
   // currently know how to prove under a final truncation, and otherwise lets
   // the caller give up instead of speculating about general arithmetic.
@@ -1552,18 +1615,21 @@ Value *materializeTruncRootedValueAtWidth(Value *V, unsigned TargetWidth,
   }
 
   if (auto *BO = dyn_cast<BinaryOperator>(V)) {
-    if (BO->getOpcode() != Instruction::Sub)
+    if (!isTruncRootedLowBitsPreservingOpcode(BO->getOpcode()))
       return nullptr;
-    auto *Zero = dyn_cast<ConstantInt>(BO->getOperand(0));
-    if (!Zero || !Zero->isZero())
-      return nullptr;
+    Value *NarrowLHS =
+        materializeTruncRootedValueAtWidth(BO->getOperand(0), TargetWidth,
+                                           InsertBefore, Cache);
     Value *NarrowRHS =
         materializeTruncRootedValueAtWidth(BO->getOperand(1), TargetWidth,
                                            InsertBefore, Cache);
-    if (!NarrowRHS)
+    if (!NarrowLHS || !NarrowRHS)
       return nullptr;
     IRBuilder<> B(InsertBefore);
-    Value *Result = B.CreateSub(ConstantInt::get(TargetTy, 0), NarrowRHS);
+    auto *Result = cast<Instruction>(B.CreateBinOp(
+        (Instruction::BinaryOps)BO->getOpcode(), NarrowLHS, NarrowRHS,
+        BO->getName() + ".narrow"));
+    Result->setDebugLoc(BO->getDebugLoc());
     if (Cache && Result)
       (*Cache)[V] = Result;
     return Result;
@@ -1607,18 +1673,18 @@ bool collectTruncRootedValueCost(
     return true;
 
   if (auto *BO = dyn_cast<BinaryOperator>(V)) {
-    if (BO->getOpcode() == Instruction::Sub) {
-      auto *Zero = dyn_cast<ConstantInt>(BO->getOperand(0));
-      if (Zero && Zero->isZero()) {
-        if (!collectTruncRootedValueCost(BO->getOperand(1), TargetWidth,
-                                         AddedValues, RemovedInstructions,
-                                         Visited))
-          return false;
-        AddedValues.insert(V);
-        if (BO->hasOneUse())
-          RemovedInstructions.insert(BO);
-        return true;
-      }
+    if (isTruncRootedLowBitsPreservingOpcode(BO->getOpcode())) {
+      if (!collectTruncRootedValueCost(BO->getOperand(0), TargetWidth,
+                                       AddedValues, RemovedInstructions,
+                                       Visited) ||
+          !collectTruncRootedValueCost(BO->getOperand(1), TargetWidth,
+                                       AddedValues, RemovedInstructions,
+                                       Visited))
+        return false;
+      AddedValues.insert(V);
+      if (BO->hasOneUse())
+        RemovedInstructions.insert(BO);
+      return true;
     }
   }
 

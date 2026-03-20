@@ -13,6 +13,12 @@ The detailed design is in
 is the source of truth for the current prototype: what is implemented, how it
 is tested, and what the next engineering steps look like.
 
+Mandatory scope rule: `WidthOpt` must remove `sext`, `zext`, and `trunc`
+itself. Appending or relying on unrelated general cleanup passes such as
+`InstSimplify`, `InstCombine`, or `AggressiveInstCombine` is not an acceptable
+way to claim effectiveness. Those passes may be used only as debugging aids or
+comparison baselines.
+
 ## Current Status
 
 The repository currently contains:
@@ -66,9 +72,10 @@ currently comes from targeted local rewrites that complement the planner.
   known zero
 - `trunc(sext(x))` or `trunc(zext(x))` folding back to the source width or a
   narrower trunc of the original source
-- `zext(trunc(x))` to low-bit masking
+- `zext(trunc(x))` to low-bit masking, including fixed integer vectors
 - trunc-rooted shrinking for:
-  - `add`
+  - `add`, including recursive rebuilding through low-bit-preserving
+    `add/sub/mul/and/or/xor` subexpressions when the root trunc pays for it
   - `select`
   - simple loop-carried `shl` recurrences
 - `udiv` retargeting when range facts and removable width changes make it
@@ -240,16 +247,12 @@ proof and regression discipline.
 - relax shared-extension merge handling so the pass keeps up with LLVM on the
   remaining conditional-dataflow case
   Current oracle losses: `test/width-opt-select-shared-ext-user-repair.ll`.
-- strengthen trunc-rooted arithmetic handling where shared wide operands still
-  block profitable narrowing
-  Current oracle losses: `test/width-opt-trunc-add-wide-operands-no-increase.ll`.
 - make the compare, trunc-rooted, and `zext(trunc(x))` rewrites work for the
   remaining vector cases where LLVM still removes casts and `width-opt` does
   not
   Current oracle losses: `test/width-opt-icmp-eq-vector-no-crash.ll`,
   `test/width-opt-trunc-add-vector-no-crash.ll`,
-  `test/width-opt-trunc-icmp-vector-no-crash.ll`, and
-  `test/width-opt-zext-trunc-vector-no-crash.ll`.
+  and `test/width-opt-trunc-icmp-vector-no-crash.ll`.
 - generalize trunc-rooted arithmetic shrinking beyond the current targeted
   helpers
 - add more direct profitability modeling so local widen/narrow decisions align

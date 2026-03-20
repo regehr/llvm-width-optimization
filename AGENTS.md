@@ -39,6 +39,18 @@ Follow the rules below unless the user explicitly overrides them.
 - Make progress proactively. Do not wait for the user to remind you to update
   TODOs, add tests, or run broader verification.
 
+## Mandatory Scope Boundary
+
+- This is mandatory, not optional advice: the job of this pass is to remove
+  `sext`, `zext`, and `trunc`.
+- Do not treat running unrelated general cleanup or canonicalization passes as
+  a valid way to make `width-opt` look better.
+- In particular, do not solve effectiveness gaps by appending or relying on
+  `InstSimplify`, `InstCombine`, `AggressiveInstCombine`, or other generic
+  optimization passes after `width-opt`.
+- Those passes may be used only as debugging aids or comparison baselines when
+  analyzing a missed optimization. They are not part of the solution.
+
 ## Tests For Effectiveness Work
 
 - Every effectiveness improvement must come with a regression test.
