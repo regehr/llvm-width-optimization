@@ -1,5 +1,10 @@
 # Design: Minimizing Width-Changing Instructions in LLVM IR
 
+This document describes the architectural direction for the project and the
+reasoning behind it. When it differs from the current implementation,
+[README.md](./README.md) is the source of truth for prototype status,
+supported transforms, and near-term engineering priorities.
+
 ## Goal
 
 Design an LLVM pass that reduces the number of integer width-changing instructions in a function, such as `zext`, `sext`, and `trunc`, while preserving semantics.
@@ -29,11 +34,20 @@ design, but it already exercises both the local and global parts of the plan.
 Implemented today:
 
 - local compare shrinking for selected ext/ext patterns
+- local compare shrinking for mixed `sext`/`zext` `eq/ne`
 - local `icmp` + `select` to min/max canonicalization
 - local `phi` and `select` shrinking for `zext`/`sext` inputs plus fitting
   constants
 - `sext` to `zext nneg` when `LazyValueInfo` proves a non-negative operand
+- demanded-bits-style `sext` to `zext nneg`, including a shared multi-use case
 - widening of `icmp eq/ne` over matching `trunc`s when known bits justify it
+- widening unsigned/equality compares from `trunc` operands when high bits are
+  known zero
+- local `zext(trunc(x))` to mask formation
+- trunc-rooted shrinking for selected `add`, `select`, and shift-recurrence
+  patterns
+- range-driven `udiv` narrowing
+- local widening of a `zext -> add -> zext` chain into a reused wider path
 - plan-driven widening of small width-polymorphic components
   - currently `phi`, `select`, `freeze`, `and`, `or`, `xor`
 - per-edge boundary repair for widened components
@@ -44,6 +58,8 @@ Current policy boundaries:
 
 - `i1` components are pinned and excluded from the global width search
 - the generic widener currently supports only small width-polymorphic regions
+- many arithmetic improvements still come from targeted local rewrites rather
+  than the global planner
 - implementation TODOs and test-promotion workflow live in `README.md`
 
 ## High-Level Strategy
@@ -72,7 +88,13 @@ That alternative width will often be narrower, but it may also be wider if
 doing so reduces the total number of conversions to neighboring anchored or
 shared users.
 
-This turns the optimization problem into a binary graph labeling problem, which can be solved exactly with a min-cut style formulation.
+This turns the optimization problem into a binary graph labeling problem, which
+can be solved exactly with a min-cut style formulation.
+
+That exact binary formulation is still the long-term design target. The current
+prototype uses a simpler candidate graph plus iterative local-improvement
+heuristic, then applies plan-driven rewrites where the implementation supports
+them.
 
 ## Anchors
 
@@ -438,7 +460,8 @@ making narrowing the primary objective.
 
 ### Why binary first
 
-If every component chooses between two labels, the problem becomes a binary labeling problem and can be solved exactly by a min-cut style formulation.
+If every component chooses between two labels, the problem becomes a binary
+labeling problem and can be solved exactly by a min-cut style formulation.
 
 The important point is that the second label need not always be a narrower
 width. It may be a widening choice when that is what reduces the total number
@@ -449,6 +472,9 @@ This gives:
 - good asymptotic behavior
 - clean implementation
 - exact optimization for the chosen model
+
+The current prototype has not implemented this exact solver yet. It uses a
+smaller planning heuristic over the same general component/candidate structure.
 
 Later, a multi-width version could use:
 
@@ -507,7 +533,13 @@ Edge costs model the number and kind of conversions needed under each label comb
 
 ### 7. Solve
 
-Run a binary cut solver or equivalent exact binary labeling algorithm.
+Long-term target:
+
+- run a binary cut solver or equivalent exact binary labeling algorithm
+
+Current prototype:
+
+- run a simpler iterative local-improvement heuristic over the candidate graph
 
 ### 8. Rewrite IR
 
@@ -544,6 +576,10 @@ The rationale is:
 
 Version 1 should therefore be implemented as a standalone function pass that is
 useful in a short fixed pipeline.
+
+That remains a good experimental placement for the current out-of-tree plugin.
+The prototype does not yet attempt to integrate itself into LLVM's default
+mid-end pipeline.
 
 ## Pseudocode
 
@@ -689,7 +725,7 @@ Adding arithmetic too early will complicate both legality and rewriting.
 
 Some conditional transforms are not just "change the type". They require a specific reconstruction pattern. The pass should capture that explicitly.
 
-## Suggested MVP
+## Original MVP
 
 The first out-of-tree implementation should:
 
@@ -700,7 +736,15 @@ The first out-of-tree implementation should:
 - rewrite conservatively
 - rely on InstCombine and DCE for cleanup
 
-This is enough to validate the core approach before expanding to arithmetic and richer cost models.
+This is enough to validate the core approach before expanding to arithmetic and
+richer cost models.
+
+The current prototype has moved past this initial boundary: it now includes a
+small amount of arithmetic, trunc-rooted loop rewriting, range-driven `udiv`
+narrowing, local widening that reduces repeated extension paths, and a simple
+global planner that already drives some whole-region widening rewrites. The
+original MVP remains useful as a statement of the initial design discipline,
+but it no longer describes the full implementation.
 
 ## Out-of-Tree Implementation Model
 
@@ -711,7 +755,8 @@ The first code drop should aim to mirror the same broad shape:
 
 - `lib/` for pass implementation
 - `include/` for shared declarations if needed
-- `test/` or `tests/` for regression coverage
+- `test/` for plugin regressions, with `tests/` reserved for future external
+  baseline cases
 - CMake wiring that builds a normal loadable pass plugin
 
 This is an engineering constraint rather than an algorithmic one, but it is

@@ -40,6 +40,20 @@ def verify_file(alive_tv: Path, src: Path, tgt: Path) -> subprocess.CompletedPro
     return run([str(alive_tv), str(src), str(tgt)])
 
 
+def print_ir_pair(repo_root: Path, src: Path, tgt: Path) -> None:
+    try:
+        src_text = src.read_text()
+        tgt_text = tgt.read_text()
+    except OSError as exc:
+        print(f"warning: failed to read IR for {src.name}: {exc}", file=sys.stderr)
+        return
+
+    print(f"=== {src.relative_to(repo_root)} : src ===")
+    print(src_text.rstrip())
+    print(f"=== {src.relative_to(repo_root)} : tgt ===")
+    print(tgt_text.rstrip())
+
+
 def collect_tests(repo_root: Path, directories: List[str]) -> List[Path]:
     tests: List[Path] = []
     for directory in directories:
@@ -95,6 +109,11 @@ def main() -> int:
         choices=["test", "tests"],
         help="Restrict verification to one or more test directories.",
     )
+    parser.add_argument(
+        "--verbose",
+        action="store_true",
+        help="Print the source and optimized IR text for each checked file.",
+    )
     args = parser.parse_args()
 
     repo_root = args.repo_root.resolve()
@@ -131,6 +150,9 @@ def main() -> int:
                 print_failure("alive-tv", test, alive_proc)
                 failures += 1
                 continue
+
+            if args.verbose:
+                print_ir_pair(repo_root, test, optimized)
 
             summary = alive_proc.stdout.strip().splitlines()
             tail = summary[-1] if summary else "ok"

@@ -10,7 +10,8 @@ number of conversions.
 
 The detailed design is in
 [width-minimization-design.md](./width-minimization-design.md). This README
-summarizes the current implementation and how to work with it.
+is the source of truth for the current prototype: what is implemented, how it
+is tested, and what the next engineering steps look like.
 
 ## Current Status
 
@@ -24,16 +25,20 @@ The repository currently contains:
   graph-labeling heuristic
 - planner-side compare affinities so `icmp` operands can influence width
   choice directly
-- several conservative local rewrites that already reduce width changes on
-  specific patterns
+- a growing set of conservative local rewrites for compare, trunc-rooted, and
+  range-driven patterns
 - conservative plan-driven widening rewrites for small width-polymorphic
   components
-- a lit regression suite, a broader baseline corpus, and an Alive2 validation
-  script
+- a lit regression suite that now covers all former baseline corpus cases
+- an Alive2 validation script, including a `--verbose` mode that prints source
+  and optimized IR
+- a historical `tests/` harness kept around for future baseline cases
 
 The current optimizer is still conservative, but it is no longer purely local.
 The global plan now drives widening of small width-polymorphic components and
-uses compare affinities to influence width choices.
+uses compare affinities to influence width choices. At the same time, a large
+fraction of the implemented behavior currently comes from targeted local
+rewrites that complement the planner.
 
 ## Implemented Local Rewrites
 
@@ -43,12 +48,27 @@ uses compare affinities to influence width choices.
   - `zext/zext`
   - `sext/sext`
   - mixed `sext/zext` for signed predicates
+  - mixed `sext/zext` for `eq/ne`
 - `icmp` + `select` to `llvm.smin/smax/umin/umax`
 - `phi` shrinking for `zext` or `sext` inputs plus fitting constants
 - `select` shrinking for `zext` or `sext` arms plus fitting constants
+- freeze-aware compare shrinking via `freeze(cast x) -> cast(freeze x)`
 - `sext` to `zext nneg` when `LazyValueInfo` proves the operand non-negative
+- demanded-bits-style `sext` to `zext nneg`
+  - single masked use
+  - compatible multi-use shared `sext`
 - widening `icmp eq/ne` over matching `trunc`s when known bits prove the
   truncated-away high bits are zero
+- widening unsigned/equality compares from `trunc` operands when high bits are
+  known zero
+- `zext(trunc(x))` to low-bit masking
+- trunc-rooted shrinking for:
+  - `add`
+  - `select`
+  - simple loop-carried `shl` recurrences
+- range-driven `udiv` narrowing
+- local widening of `zext -> add -> zext` chains to reuse an existing wider
+  extension path
 - plan-driven widening of components built from `phi`, `select`, `freeze`,
   `and`, `or`, and `xor`
 - per-edge boundary repair for widened components, including retargeting
@@ -62,19 +82,18 @@ search space.
 
 - `include/`, `lib/`: plugin source
 - `test/`: lit regression tests for this plugin
-- `tests/`: broader baseline corpus against stock LLVM
+- `tests/`: historical baseline harness and documentation for future corpus use
 - `scripts/verify_with_alive2.py`: optimize each `.ll` test with `width-opt`
   and check correctness with Alive2
 - `width-minimization-design.md`: design document
 
 The two test directories have different roles:
 
-- `test/` tracks behavior that this plugin already implements
-- `tests/` tracks broader patterns and current LLVM behavior, including cases
-  that this plugin does not yet handle
+- `test/` tracks behavior that this plugin implements
+- `tests/` is reserved for future baseline/corpus cases; at the moment it does
+  not contain any `.ll` files
 
-When something in `tests/` starts working in `width-opt`, it should be promoted
-into `test/` immediately and turned into a checked plugin regression.
+The original external corpus has been fully promoted into `test/`.
 
 ## Building
 
@@ -124,14 +143,17 @@ Run the plugin regression suite:
   /Users/regehr/tmp/llvm-width-optimization-build/test
 ```
 
-Run the stock-LLVM baseline corpus:
+Run the historical baseline harness after adding new external corpus files
+under `tests/`:
 
 ```bash
 zsh /Users/regehr/llvm-width-optimization/tests/run-baseline.sh
 ```
 
-Run Alive2 over both `test/` and `tests/` after optimizing each file with
-`width-opt`:
+At the moment, `tests/` contains no `.ll` files, so this harness is dormant.
+
+Run Alive2 over all `.ll` files under `test/` and any future `.ll` files under
+`tests/` after optimizing them with `width-opt`:
 
 ```bash
 python3 /Users/regehr/llvm-width-optimization/scripts/verify_with_alive2.py
@@ -144,6 +166,13 @@ By default, the script uses:
 - plugin: `/Users/regehr/tmp/llvm-width-optimization-build/lib/libWidthOpt.dylib`
 
 These can be overridden with `--opt-bin`, `--alive-tv`, and `--plugin`.
+
+Verbose mode prints the source and optimized IR text for each file:
+
+```bash
+python3 /Users/regehr/llvm-width-optimization/scripts/verify_with_alive2.py \
+  --verbose
+```
 
 ## Design Direction
 
@@ -161,39 +190,26 @@ AggressiveInstCombine's `TruncInstCombine`: those are primarily local,
 pattern-driven reducers, while this project is aimed at whole-function width
 assignment.
 
-## TODO
+The long-term design calls for a small-label global optimization problem. The
+current prototype does not solve that problem exactly yet: it uses a simpler
+candidate graph plus iterative planning heuristic, then applies conservative
+plan-driven rewrites where the implementation is ready.
 
-This is the authoritative implementation queue.
+## Future Work
 
-General policy:
+The obvious next steps are no longer about filling out the original test
+corpus. They are about broadening the optimizer while keeping the existing
+proof and regression discipline.
 
-- use the remaining corpus in `tests/` to choose what to implement next
-- as soon as a `tests/` case is genuinely supported by `width-opt`, promote it
-  into `test/` with explicit `FileCheck` coverage
-
-Near-term items:
-
-- add freeze-aware compare shrinking
-  - target: `tests/yes-freeze-icmp-ult-zext-zext.ll`
-- add `zext(trunc(x))` to mask formation
-  - target: `tests/yes-zext-trunc-to-mask.ll`
-- add mixed `sext`/`zext` equality compare narrowing
-  - target: `tests/no-icmp-eq-sext-zext.ll`
-- add range-aware compare retargeting under `assume`
-  - target: `tests/yes-icmp-assume-trunc-zext.ll`
-- extend demanded-bits/range-based `sext` to `zext` weakening
-  - targets:
-    - `tests/yes-sext-to-zext-demanded-bits.ll`
-    - `tests/yes-sext-multiuse-to-zext.ll`
-
-Later items:
-
-- trunc-rooted narrowing through arithmetic and select
-  - targets:
-    - `tests/yes-trunc-add-zext-operand.ll`
-    - `tests/yes-select-sext-trunc.ll`
-    - `tests/yes-trunc-phi-loop.ll`
-- range-driven op narrowing beyond compares
-  - target: `tests/yes-udiv-range-narrowing.ll`
-- richer global planning for multiple alternative wide widths
-  - target: `tests/no-global-widening-two-wide-widths.ll`
+- generalize the global planner beyond the current simple heuristic and binary
+  candidate model
+- broaden plan-driven rewrites to more instruction kinds than the current small
+  width-polymorphic regions
+- strengthen legality reasoning with more systematic known-bits, range, and
+  demanded-bits integration
+- generalize trunc-rooted arithmetic shrinking beyond the current targeted
+  helpers
+- add more direct profitability modeling so local widen/narrow decisions align
+  better with the global objective
+- add new external baseline cases under `tests/` as fresh gaps are discovered,
+  and keep promoting them into `test/` once supported
