@@ -916,7 +916,21 @@ struct ExternalExtUser {
 };
 
 bool isWidenablePolyInstruction(Instruction &I) {
-  return isa<PHINode>(I) || isa<SelectInst>(I) || isa<FreezeInst>(I);
+  if (isa<PHINode>(I) || isa<SelectInst>(I) || isa<FreezeInst>(I))
+    return true;
+
+  auto *BO = dyn_cast<BinaryOperator>(&I);
+  if (!BO)
+    return false;
+
+  switch (BO->getOpcode()) {
+  case Instruction::And:
+  case Instruction::Or:
+  case Instruction::Xor:
+    return true;
+  default:
+    return false;
+  }
 }
 
 bool tryWidenComponentFromPlan(const Component &C, const AnalysisResult &R,
@@ -1056,6 +1070,30 @@ bool tryWidenComponentFromPlan(const Component &C, const AnalysisResult &R,
         WideFreeze->setDebugLoc(Fr->getDebugLoc());
         WideFreeze->takeName(Fr);
         NewValues[Fr] = WideFreeze;
+        Progress = true;
+        --Remaining;
+        continue;
+      }
+
+      if (auto *BO = dyn_cast<BinaryOperator>(I)) {
+        auto getWideValue = [&](Value *V) -> Value * {
+          if (ComponentValues.count(V))
+            return NewValues.lookup(V);
+          return materializeValueAtWidth(V, InternalKind, TargetWidth, BO);
+        };
+
+        Value *WideLHS = getWideValue(BO->getOperand(0));
+        Value *WideRHS = getWideValue(BO->getOperand(1));
+        if (!WideLHS || !WideRHS)
+          continue;
+
+        IRBuilder<> B(BO);
+        auto *WideBO = cast<Instruction>(
+            B.CreateBinOp((Instruction::BinaryOps)BO->getOpcode(), WideLHS,
+                          WideRHS));
+        WideBO->setDebugLoc(BO->getDebugLoc());
+        WideBO->takeName(BO);
+        NewValues[BO] = WideBO;
         Progress = true;
         --Remaining;
         continue;
