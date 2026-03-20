@@ -21,6 +21,31 @@ The key idea is to separate:
 
 This avoids rewrite search and should scale much better than trying many local transformations blindly.
 
+## Prototype Status
+
+The current out-of-tree prototype is intentionally narrower than the full
+design, but it already exercises both the local and global parts of the plan.
+
+Implemented today:
+
+- local compare shrinking for selected ext/ext patterns
+- local `icmp` + `select` to min/max canonicalization
+- local `phi` and `select` shrinking for `zext`/`sext` inputs plus fitting
+  constants
+- `sext` to `zext nneg` when `LazyValueInfo` proves a non-negative operand
+- widening of `icmp eq/ne` over matching `trunc`s when known bits justify it
+- plan-driven widening of small width-polymorphic components
+  - currently `phi`, `select`, `freeze`, `and`, `or`, `xor`
+- per-edge boundary repair for widened components
+- planner-side compare affinities so `icmp` operands can pull component widths
+  toward agreement
+
+Current policy boundaries:
+
+- `i1` components are pinned and excluded from the global width search
+- the generic widener currently supports only small width-polymorphic regions
+- implementation TODOs and test-promotion workflow live in `README.md`
+
 ## High-Level Strategy
 
 The pass has two phases.

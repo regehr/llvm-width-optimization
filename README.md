@@ -22,14 +22,18 @@ The repository currently contains:
   patterns
 - a first width-plan analysis that chooses per-component widths with a simple
   graph-labeling heuristic
+- planner-side compare affinities so `icmp` operands can influence width
+  choice directly
 - several conservative local rewrites that already reduce width changes on
   specific patterns
+- conservative plan-driven widening rewrites for small width-polymorphic
+  components
 - a lit regression suite, a broader baseline corpus, and an Alive2 validation
   script
 
-The current optimizer is still mostly local. The global plan analysis exists
-now as infrastructure and a debugging surface; it is not yet driving whole-
-component rewrites.
+The current optimizer is still conservative, but it is no longer purely local.
+The global plan now drives widening of small width-polymorphic components and
+uses compare affinities to influence width choices.
 
 ## Implemented Local Rewrites
 
@@ -45,13 +49,20 @@ component rewrites.
 - `sext` to `zext nneg` when `LazyValueInfo` proves the operand non-negative
 - widening `icmp eq/ne` over matching `trunc`s when known bits prove the
   truncated-away high bits are zero
+- plan-driven widening of components built from `phi`, `select`, `freeze`,
+  `and`, `or`, and `xor`
+- per-edge boundary repair for widened components, including retargeting
+  external `icmp` users when the widened representation is compatible
+
+The current planner keeps `i1` components fixed. Boolean values are tracked
+for analysis and printing, but they are outside the current global width
+search space.
 
 ## Repository Layout
 
 - `include/`, `lib/`: plugin source
 - `test/`: lit regression tests for this plugin
 - `tests/`: broader baseline corpus against stock LLVM
-- `smax.ll`: original motivating example
 - `scripts/verify_with_alive2.py`: optimize each `.ll` test with `width-opt`
   and check correctness with Alive2
 - `width-minimization-design.md`: design document
@@ -63,7 +74,7 @@ The two test directories have different roles:
   that this plugin does not yet handle
 
 When something in `tests/` starts working in `width-opt`, it should be promoted
-into `test/`.
+into `test/` immediately and turned into a checked plugin regression.
 
 ## Building
 
@@ -149,3 +160,40 @@ This is intentionally different from existing LLVM passes like InstCombine and
 AggressiveInstCombine's `TruncInstCombine`: those are primarily local,
 pattern-driven reducers, while this project is aimed at whole-function width
 assignment.
+
+## TODO
+
+This is the authoritative implementation queue.
+
+General policy:
+
+- use the remaining corpus in `tests/` to choose what to implement next
+- as soon as a `tests/` case is genuinely supported by `width-opt`, promote it
+  into `test/` with explicit `FileCheck` coverage
+
+Near-term items:
+
+- add freeze-aware compare shrinking
+  - target: `tests/yes-freeze-icmp-ult-zext-zext.ll`
+- add `zext(trunc(x))` to mask formation
+  - target: `tests/yes-zext-trunc-to-mask.ll`
+- add mixed `sext`/`zext` equality compare narrowing
+  - target: `tests/no-icmp-eq-sext-zext.ll`
+- add range-aware compare retargeting under `assume`
+  - target: `tests/yes-icmp-assume-trunc-zext.ll`
+- extend demanded-bits/range-based `sext` to `zext` weakening
+  - targets:
+    - `tests/yes-sext-to-zext-demanded-bits.ll`
+    - `tests/yes-sext-multiuse-to-zext.ll`
+
+Later items:
+
+- trunc-rooted narrowing through arithmetic and select
+  - targets:
+    - `tests/yes-trunc-add-zext-operand.ll`
+    - `tests/yes-select-sext-trunc.ll`
+    - `tests/yes-trunc-phi-loop.ll`
+- range-driven op narrowing beyond compares
+  - target: `tests/yes-udiv-range-narrowing.ll`
+- richer global planning for multiple alternative wide widths
+  - target: `tests/no-global-widening-two-wide-widths.ll`

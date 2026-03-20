@@ -665,6 +665,84 @@ bool tryConvertSExtToNonNegZExt(SExtInst &Ext, LazyValueInfo &LVI) {
   return true;
 }
 
+bool tryFoldZExtOfTruncToMask(ZExtInst &Ext) {
+  auto *Tr = dyn_cast<TruncInst>(Ext.getOperand(0));
+  if (!Tr)
+    return false;
+
+  Value *Src = Tr->getOperand(0);
+  assert(isIntegerValue(Src) && "Expected integer source for trunc");
+  unsigned SrcWidth = getValueWidth(Src);
+  unsigned NarrowWidth = getValueWidth(Tr);
+  unsigned WideWidth = getValueWidth(&Ext);
+  if (NarrowWidth >= WideWidth)
+    return false;
+
+  IRBuilder<> B(&Ext);
+
+  // Materialize the mask in the most convenient width we can without
+  // reintroducing the original narrow type. When the original source is at
+  // least as wide as the zext result, work directly at the result width.
+  // Otherwise keep the source width, mask there, and extend once at the end.
+  Value *Masked = nullptr;
+  if (SrcWidth >= WideWidth) {
+    Value *Base = Src;
+    if (SrcWidth != WideWidth)
+      Base = B.CreateTrunc(Src, IntegerType::get(Ext.getContext(), WideWidth));
+    APInt Mask = APInt::getLowBitsSet(WideWidth, NarrowWidth);
+    Masked = B.CreateAnd(Base, ConstantInt::get(Base->getType(), Mask));
+  } else {
+    APInt Mask = APInt::getLowBitsSet(SrcWidth, NarrowWidth);
+    Value *Narrowed = B.CreateAnd(Src, ConstantInt::get(Src->getType(), Mask));
+    Masked = B.CreateZExt(Narrowed, Ext.getType());
+  }
+
+  auto *NewI = cast<Instruction>(Masked);
+  NewI->setDebugLoc(Ext.getDebugLoc());
+  NewI->takeName(&Ext);
+  Ext.replaceAllUsesWith(NewI);
+  Ext.eraseFromParent();
+
+  if (Tr->use_empty())
+    RecursivelyDeleteTriviallyDeadInstructions(Tr);
+
+  return true;
+}
+
+bool tryPushFreezeThroughExt(FreezeInst &FI) {
+  // Canonicalize freeze(ext x) into ext(freeze x) for simple integer casts.
+  // This follows the safe direction used by InstCombine: the cast only
+  // propagates poison from its operand, so freezing the narrow operand is
+  // sufficient to stop poison without inventing a wider arbitrary value.
+  auto *Cast = dyn_cast<CastInst>(FI.getOperand(0));
+  if (!Cast || !Cast->hasOneUse())
+    return false;
+
+  if (!isa<ZExtInst>(Cast) && !isa<SExtInst>(Cast) && !isa<TruncInst>(Cast))
+    return false;
+
+  Value *Src = Cast->getOperand(0);
+  assert(isIntegerValue(Src) && isIntegerValue(&FI) &&
+         "Freeze-through-cast expects integer values");
+
+  IRBuilder<> B(Cast);
+  auto *FrozenSrc = cast<FreezeInst>(
+      B.CreateFreeze(Src, Src->hasName() ? Src->getName() + ".fr" : ""));
+
+  Instruction *NewCast = CastInst::Create(Cast->getOpcode(), FrozenSrc,
+                                          FI.getType(), "",
+                                          FI.getIterator());
+  NewCast->setDebugLoc(FI.getDebugLoc());
+  NewCast->takeName(&FI);
+  FI.replaceAllUsesWith(NewCast);
+  FI.eraseFromParent();
+
+  if (Cast->use_empty())
+    RecursivelyDeleteTriviallyDeadInstructions(Cast);
+
+  return true;
+}
+
 void inferCandidatesFromInstruction(Instruction &I, AnalysisResult &R) {
   // Candidate widths are intentionally cheap and local. This is not a legality
   // proof; it is only a way to seed the planner with widths that are already
@@ -1418,6 +1496,8 @@ PreservedAnalyses WidthOptPass::run(Function &F, FunctionAnalysisManager &AM) {
   SmallVector<SelectInst *, 16> Selects;
   SmallVector<PHINode *, 16> Phis;
   SmallVector<SExtInst *, 16> SExts;
+  SmallVector<ZExtInst *, 16> ZExts;
+  SmallVector<FreezeInst *, 16> Freezes;
   for (Instruction &I : instructions(F))
     if (auto *Cmp = dyn_cast<ICmpInst>(&I))
       Worklist.push_back(Cmp);
@@ -1425,17 +1505,33 @@ PreservedAnalyses WidthOptPass::run(Function &F, FunctionAnalysisManager &AM) {
       Selects.push_back(Sel);
     else if (auto *Phi = dyn_cast<PHINode>(&I))
       Phis.push_back(Phi);
+    else if (auto *ZExt = dyn_cast<ZExtInst>(&I))
+      ZExts.push_back(ZExt);
     else if (auto *SExt = dyn_cast<SExtInst>(&I))
       SExts.push_back(SExt);
+    else if (auto *FI = dyn_cast<FreezeInst>(&I))
+      Freezes.push_back(FI);
 
   bool Changed = false;
 
   // Run small local canonicalizations first. They simplify the IR, improve the
   // candidate-width graph, and expose cleaner regions for the global planner.
+  for (ZExtInst *ZExt : ZExts) {
+    if (ZExt->getParent() == nullptr)
+      continue;
+    Changed |= tryFoldZExtOfTruncToMask(*ZExt);
+  }
+
   for (SExtInst *SExt : SExts) {
     if (SExt->getParent() == nullptr)
       continue;
     Changed |= tryConvertSExtToNonNegZExt(*SExt, LVI);
+  }
+
+  for (FreezeInst *FI : Freezes) {
+    if (FI->getParent() == nullptr)
+      continue;
+    Changed |= tryPushFreezeThroughExt(*FI);
   }
 
   for (ICmpInst *Cmp : Worklist) {
