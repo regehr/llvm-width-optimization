@@ -57,6 +57,12 @@ struct ExtensionPressure {
   unsigned Weight = 0;
 };
 
+struct CompareRetargetPressure {
+  unsigned Component = 0;
+  bool PreferSExt = false;
+  unsigned Weight = 0;
+};
+
 struct AnalysisResult {
   llvm::DenseMap<const llvm::Value *, unsigned> ValueToComponent;
   llvm::SmallVector<Component, 8> Components;
@@ -64,6 +70,7 @@ struct AnalysisResult {
   llvm::SmallVector<CompareAffinity, 8> CompareAffinities;
   llvm::SmallVector<AnchorPressure, 8> AnchorPressures;
   llvm::SmallVector<ExtensionPressure, 8> ExtensionPressures;
+  llvm::SmallVector<CompareRetargetPressure, 8> CompareRetargetPressures;
 };
 
 struct PlanResult {

@@ -2018,8 +2018,19 @@ std::optional<ExtKind> getPreferredInternalKindForWidth(const AnalysisResult &R,
     else
       NumZExt += E.Weight;
   }
+  for (const CompareRetargetPressure &P : R.CompareRetargetPressures) {
+    if (P.Component != ComponentID)
+      continue;
+    if (P.PreferSExt)
+      NumSExt += P.Weight;
+    else
+      NumZExt += P.Weight;
+  }
   return NumSExt > NumZExt ? ExtKind::SExt : ExtKind::ZExt;
 }
+
+bool canUnsignedCompareSelectSplitPressureBypass(ICmpInst &Cmp,
+                                                 Value *ComponentOp);
 
 unsigned extensionMismatchCost(const AnalysisResult &R,
                                ArrayRef<unsigned> ChosenWidths,
@@ -2060,6 +2071,35 @@ unsigned totalExtensionMismatchCost(const AnalysisResult &R,
   return Cost;
 }
 
+unsigned compareRetargetMismatchCost(const AnalysisResult &R,
+                                     unsigned ComponentID, unsigned Width) {
+  auto InternalKind = getPreferredInternalKindForWidth(R, ComponentID, Width);
+  if (!InternalKind)
+    return 0;
+
+  unsigned Cost = 0;
+  for (const CompareRetargetPressure &P : R.CompareRetargetPressures) {
+    if (P.Component != ComponentID)
+      continue;
+    ExtKind Preferred = P.PreferSExt ? ExtKind::SExt : ExtKind::ZExt;
+    if (*InternalKind != Preferred)
+      Cost += P.Weight;
+  }
+  return Cost;
+}
+
+unsigned totalCompareRetargetMismatchCost(const AnalysisResult &R,
+                                          ArrayRef<unsigned> ChosenWidths) {
+  unsigned Cost = 0;
+  for (const Component &C : R.Components) {
+    if (C.ID >= ChosenWidths.size())
+      continue;
+    Cost +=
+        compareRetargetMismatchCost(R, C.ID, ChosenWidths[C.ID]);
+  }
+  return Cost;
+}
+
 unsigned scoreWidthChoice(const AnalysisResult &R,
                           ArrayRef<unsigned> ChosenWidths,
                           unsigned ComponentID, unsigned Width) {
@@ -2087,6 +2127,7 @@ unsigned scoreWidthChoice(const AnalysisResult &R,
     Score += A.Weight * anchorPressureCost(Width, A.Width);
   }
   Score += extensionMismatchCost(R, ChosenWidths, ComponentID, Width);
+  Score += compareRetargetMismatchCost(R, ComponentID, Width);
   return Score;
 }
 
@@ -2182,6 +2223,7 @@ PlanResult computeWidthPlan(const AnalysisResult &R) {
         A.Weight * anchorPressureCost(Plan.ChosenWidths[A.Component], A.Width);
   }
   Plan.TotalCutCost += totalExtensionMismatchCost(R, Plan.ChosenWidths);
+  Plan.TotalCutCost += totalCompareRetargetMismatchCost(R, Plan.ChosenWidths);
 
   return Plan;
 }
@@ -2249,6 +2291,7 @@ AnalysisResult computeWidthComponents(Function &F) {
   DenseMap<uint64_t, unsigned> AffinityKeyToIndex;
   DenseMap<uint64_t, unsigned> AnchorKeyToIndex;
   DenseMap<uint64_t, unsigned> ExtKeyToIndex;
+  DenseMap<uint64_t, unsigned> CompareRetargetKeyToIndex;
   for (Instruction &I : instructions(F)) {
     // Ordinary cross-component def-use edges become cut candidates in the
     // planner: differing chosen widths here imply a boundary conversion.
@@ -2323,6 +2366,28 @@ AnalysisResult computeWidthComponents(Function &F) {
           if (Inserted)
             R.CompareAffinities.push_back(CompareAffinity{A, B, 0});
           ++R.CompareAffinities[AffinityIt->second].Weight;
+        }
+      }
+
+      if (isSignedICmp(Cmp->getPredicate()) || isUnsignedICmp(Cmp->getPredicate())) {
+        bool PreferSExt = isSignedICmp(Cmp->getPredicate());
+        for (unsigned Idx = 0; Idx != 2; ++Idx) {
+          Value *Op = Cmp->getOperand(Idx);
+          if (!shouldTrackValue(Op))
+            continue;
+          if (!PreferSExt &&
+              canUnsignedCompareSelectSplitPressureBypass(*Cmp, Op))
+            continue;
+          auto OpIt = R.ValueToComponent.find(Op);
+          if (OpIt == R.ValueToComponent.end())
+            continue;
+          uint64_t Key = (uint64_t(OpIt->second) << 1) | uint64_t(PreferSExt);
+          auto [PRIt, Inserted] = CompareRetargetKeyToIndex.try_emplace(
+              Key, R.CompareRetargetPressures.size());
+          if (Inserted)
+            R.CompareRetargetPressures.push_back(
+                CompareRetargetPressure{OpIt->second, PreferSExt, 0});
+          ++R.CompareRetargetPressures[PRIt->second].Weight;
         }
       }
     }
@@ -2502,6 +2567,25 @@ bool canRetargetBoundaryCompare(ICmpInst::Predicate Pred, ExtKind InternalKind) 
   if (isSignedICmp(Pred))
     return InternalKind == ExtKind::SExt;
   return false;
+}
+
+bool canUnsignedCompareSelectSplitPressureBypass(ICmpInst &Cmp,
+                                                 Value *ComponentOp) {
+  if (!isUnsignedICmp(Cmp.getPredicate()))
+    return false;
+
+  auto *Sel = dyn_cast<SelectInst>(ComponentOp);
+  if (!Sel || !isIntegerValue(Sel))
+    return false;
+
+  auto *TrueC = dyn_cast<ConstantInt>(Sel->getTrueValue());
+  auto *FalseC = dyn_cast<ConstantInt>(Sel->getFalseValue());
+  if (!TrueC || !FalseC)
+    return false;
+
+  Value *Other = Cmp.getOperand(0) == ComponentOp ? Cmp.getOperand(1)
+                                                  : Cmp.getOperand(0);
+  return isIntegerValue(Other) && getValueWidth(Other) == getValueWidth(Sel);
 }
 
 bool tryRetargetExternalUnsignedCompareViaSelect(ICmpInst &Cmp,
@@ -2724,11 +2808,9 @@ bool tryWidenComponentFromPlan(const Component &C, const AnalysisResult &R,
   } else if (SingletonKind == SingletonWidenKind::UnsignedMinMax) {
     InternalKind = ExtKind::ZExt;
   } else {
-    // Policy choice: pick the target-width extension kind that eliminates the
-    // larger number of existing boundary casts. Ties still prefer zero
-    // extension because it remains the more neutral boundary representation.
-    InternalKind = NumSExtToTarget > NumZExtToTarget ? ExtKind::SExt
-                                                     : ExtKind::ZExt;
+    auto PreferredKind =
+        getPreferredInternalKindForWidth(R, C.ID, TargetWidth);
+    InternalKind = PreferredKind.value_or(ExtKind::ZExt);
   }
 
   auto *TargetTy = IntegerType::get(C.Instructions.front()->getContext(),
@@ -3079,6 +3161,10 @@ PreservedAnalyses WidthPlanPrinter::run(Function &F,
   for (const AnchorPressure &A : R.AnchorPressures)
     OS << formatv("  anchor-pressure component {0} -> i{1} weight={2}\n",
                   A.Component, A.Width, A.Weight);
+  for (const CompareRetargetPressure &P : R.CompareRetargetPressures)
+    OS << formatv("  compare-retarget-pressure component {0} prefer={1} "
+                  "weight={2}\n",
+                  P.Component, P.PreferSExt ? "sext" : "zext", P.Weight);
 
   return PreservedAnalyses::all();
 }
