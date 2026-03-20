@@ -64,6 +64,8 @@ currently comes from targeted local rewrites that complement the planner.
   truncated-away high bits are zero
 - widening unsigned/equality compares from `trunc` operands when high bits are
   known zero
+- `trunc(sext(x))` or `trunc(zext(x))` folding back to the source width or a
+  narrower trunc of the original source
 - `zext(trunc(x))` to low-bit masking
 - trunc-rooted shrinking for:
   - `add`
@@ -235,8 +237,7 @@ proof and regression discipline.
   close the current LLVM-win gaps below
 - improve compare-focused local rewrites and boundary retargeting so the pass
   keeps up with LLVM on the remaining scalar compare cases
-  Current oracle losses: `test/width-opt-component-widen-icmp-ult-no-retarget.ll`
-  and `test/width-opt-icmp-ult-shared-trunc-no-increase.ll`.
+  Current oracle losses: `test/width-opt-component-widen-icmp-ult-no-retarget.ll`.
 - relax shared-extension merge handling so the pass keeps up with LLVM on the
   remaining conditional-dataflow case
   Current oracle losses: `test/width-opt-select-shared-ext-user-repair.ll`.

@@ -45,6 +45,8 @@ Implemented today:
 - widening of `icmp eq/ne` over matching `trunc`s when known bits justify it
 - widening unsigned/equality compares from `trunc` operands when high bits are
   known zero
+- local folding of `trunc(sext(x))` or `trunc(zext(x))` back to the original
+  source width or a narrower trunc of that source
 - local `zext(trunc(x))` to mask formation
 - trunc-rooted shrinking for selected `add`, `select`, and shift-recurrence
   patterns

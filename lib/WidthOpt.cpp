@@ -1339,6 +1339,40 @@ bool tryFoldZExtOfTruncToMask(ZExtInst &Ext) {
   return true;
 }
 
+bool tryFoldTruncOfExt(TruncInst &Tr) {
+  auto Ext = getExtOperandInfo(Tr.getOperand(0));
+  if (!Ext)
+    return false;
+
+  unsigned TargetWidth = getValueWidth(&Tr);
+  if (TargetWidth > Ext->NarrowWidth)
+    return false;
+
+  Value *Replacement = nullptr;
+  if (TargetWidth == Ext->NarrowWidth) {
+    Replacement = Ext->NarrowValue;
+  } else {
+    IRBuilder<> B(&Tr);
+    if (auto *C = dyn_cast<ConstantInt>(Ext->NarrowValue)) {
+      Replacement = convertConstantToNarrow(*C, TargetWidth);
+    } else {
+      auto *NewTr =
+          cast<Instruction>(B.CreateTrunc(Ext->NarrowValue, Tr.getType(),
+                                          Tr.getName()));
+      NewTr->setDebugLoc(Tr.getDebugLoc());
+      Replacement = NewTr;
+    }
+  }
+
+  Tr.replaceAllUsesWith(Replacement);
+  Tr.eraseFromParent();
+
+  if (Ext->Producer->use_empty())
+    RecursivelyDeleteTriviallyDeadInstructions(Ext->Producer);
+
+  return true;
+}
+
 bool tryShrinkTruncOfAdd(TruncInst &Tr) {
   auto *BO = dyn_cast<BinaryOperator>(Tr.getOperand(0));
   if (!BO || BO->getOpcode() != Instruction::Add || !BO->hasOneUse())
@@ -2129,6 +2163,10 @@ bool runStructuralLocalRewritesToFixpoint(Function &F) {
     for (TruncInst *Tr : WL.Truncs) {
       if (Tr->getParent() == nullptr)
         continue;
+      if (tryFoldTruncOfExt(*Tr)) {
+        ChangedThisRound = true;
+        continue;
+      }
       if (tryShrinkTruncOfShiftRecurrence(*Tr)) {
         ChangedThisRound = true;
         continue;
