@@ -742,6 +742,11 @@ bool tryFoldAndOfSExtToZExt(BinaryOperator &And) {
   if (!Mask || !Ext)
     return false;
 
+  // Leave shared sign-extensions to the whole-value conversion path so we
+  // preserve a single widened value across all compatible uses.
+  if (!Ext->hasOneUse())
+    return false;
+
   unsigned SrcWidth = getValueWidth(Ext->getOperand(0));
   unsigned WideWidth = getValueWidth(Ext);
   assert(Mask->getBitWidth() == WideWidth &&
@@ -760,6 +765,47 @@ bool tryFoldAndOfSExtToZExt(BinaryOperator &And) {
   And.replaceUsesOfWith(Ext, ZExt);
   if (Ext->use_empty())
     Ext->eraseFromParent();
+  return true;
+}
+
+bool sextUseAllowsZExt(User &U, SExtInst &Ext) {
+  if (auto *BO = dyn_cast<BinaryOperator>(&U)) {
+    switch (BO->getOpcode()) {
+    case Instruction::And:
+      if (auto *Mask = dyn_cast<ConstantInt>(BO->getOperand(0) == &Ext
+                                                 ? BO->getOperand(1)
+                                                 : BO->getOperand(0))) {
+        unsigned SrcWidth = getValueWidth(Ext.getOperand(0));
+        unsigned WideWidth = getValueWidth(&Ext);
+        APInt DemandedMask = APInt::getLowBitsSet(WideWidth, SrcWidth);
+        return (Mask->getValue() & ~DemandedMask) == 0;
+      }
+      return false;
+    case Instruction::LShr:
+      return BO->getOperand(0) == &Ext;
+    default:
+      return false;
+    }
+  }
+
+  return false;
+}
+
+bool tryConvertWholeSExtToZExt(SExtInst &Ext) {
+  if (Ext.use_empty())
+    return false;
+
+  for (User *U : Ext.users())
+    if (!sextUseAllowsZExt(*U, Ext))
+      return false;
+
+  auto *ZExt = CastInst::CreateZExtOrBitCast(Ext.getOperand(0), Ext.getType(),
+                                             "", Ext.getIterator());
+  ZExt->setDebugLoc(Ext.getDebugLoc());
+  ZExt->takeName(&Ext);
+  ZExt->setNonNeg();
+  Ext.replaceAllUsesWith(ZExt);
+  Ext.eraseFromParent();
   return true;
 }
 
@@ -1687,6 +1733,10 @@ PreservedAnalyses WidthOptPass::run(Function &F, FunctionAnalysisManager &AM) {
   for (SExtInst *SExt : SExts) {
     if (SExt->getParent() == nullptr)
       continue;
+    if (tryConvertWholeSExtToZExt(*SExt)) {
+      Changed = true;
+      continue;
+    }
     Changed |= tryConvertSExtToNonNegZExt(*SExt, LVI);
   }
 
