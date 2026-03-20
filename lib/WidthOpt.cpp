@@ -1186,6 +1186,9 @@ bool tryShrinkTruncOfAdd(TruncInst &Tr) {
   auto *BO = dyn_cast<BinaryOperator>(Tr.getOperand(0));
   if (!BO || BO->getOpcode() != Instruction::Add || !BO->hasOneUse())
     return false;
+  if (!isIntegerValue(&Tr) || !isIntegerValue(BO) ||
+      !isIntegerValue(BO->getOperand(0)) || !isIntegerValue(BO->getOperand(1)))
+    return false;
 
   unsigned TargetWidth = getValueWidth(&Tr);
   unsigned SourceWidth = getValueWidth(BO);
