@@ -911,150 +911,178 @@ static AnalysisResult computeWidthComponents(Function &F) {
   return R;
 }
 
-static bool tryWidenPhiFromPlan(PHINode &Phi, const AnalysisResult &R,
-                                const PlanResult &Plan) {
-  auto CompIt = R.ValueToComponent.find(&Phi);
-  if (CompIt == R.ValueToComponent.end())
-    return false;
+struct ExternalExtUser {
+  Instruction *Ext = nullptr;
+  Value *OldValue = nullptr;
+};
 
-  const Component &C = R.Components[CompIt->second];
-  if (C.Fixed || C.Instructions.size() != 1 || C.Instructions.front() != &Phi)
-    return false;
-
-  unsigned OrigWidth = getValueWidth(&Phi);
-  unsigned TargetWidth = Plan.ChosenWidths[C.ID];
-  if (TargetWidth <= OrigWidth)
-    return false;
-
-  ExtKind Kind = ExtKind::None;
-  SmallVector<Instruction *, 8> ExtUsers;
-  for (User *U : Phi.users()) {
-    auto *I = dyn_cast<Instruction>(U);
-    if (!I)
-      return false;
-
-    ExtKind UserKind = ExtKind::None;
-    if (auto *Z = dyn_cast<ZExtInst>(I)) {
-      if (Z->getOperand(0) != &Phi || getValueWidth(Z) != TargetWidth)
-        return false;
-      UserKind = ExtKind::ZExt;
-    } else if (auto *S = dyn_cast<SExtInst>(I)) {
-      if (S->getOperand(0) != &Phi || getValueWidth(S) != TargetWidth)
-        return false;
-      UserKind = ExtKind::SExt;
-    } else {
-      return false;
-    }
-
-    if (Kind == ExtKind::None)
-      Kind = UserKind;
-    else if (Kind != UserKind)
-      return false;
-
-    ExtUsers.push_back(I);
-  }
-
-  if (Kind == ExtKind::None || ExtUsers.empty())
-    return false;
-
-  auto *TargetTy = IntegerType::get(Phi.getContext(), TargetWidth);
-  auto *NewPhi =
-      PHINode::Create(TargetTy, Phi.getNumIncomingValues(), "", Phi.getIterator());
-  NewPhi->setDebugLoc(Phi.getDebugLoc());
-
-  for (unsigned I = 0, E = Phi.getNumIncomingValues(); I != E; ++I) {
-    Value *Incoming = Phi.getIncomingValue(I);
-    BasicBlock *Pred = Phi.getIncomingBlock(I);
-    Instruction *InsertBefore = Pred->getTerminator();
-    Value *WideIncoming =
-        materializeValueAtWidth(Incoming, Kind, TargetWidth, InsertBefore);
-    NewPhi->addIncoming(WideIncoming, Pred);
-  }
-
-  NewPhi->takeName(&Phi);
-  for (Instruction *Ext : ExtUsers) {
-    Ext->replaceAllUsesWith(NewPhi);
-    Ext->eraseFromParent();
-  }
-
-  if (Phi.use_empty()) {
-    Phi.eraseFromParent();
-    return true;
-  }
-
-  NewPhi->eraseFromParent();
-  return false;
+static bool isWidenablePolyInstruction(Instruction &I) {
+  return isa<PHINode>(I) || isa<SelectInst>(I) || isa<FreezeInst>(I);
 }
 
-static bool tryWidenSelectFromPlan(SelectInst &Sel, const AnalysisResult &R,
-                                   const PlanResult &Plan) {
-  auto CompIt = R.ValueToComponent.find(&Sel);
-  if (CompIt == R.ValueToComponent.end())
+static bool tryWidenComponentFromPlan(const Component &C, const AnalysisResult &R,
+                                      const PlanResult &Plan) {
+  if (C.Fixed || C.Instructions.empty())
     return false;
 
-  const Component &C = R.Components[CompIt->second];
-  if (C.Fixed || C.Instructions.size() != 1 || C.Instructions.front() != &Sel)
-    return false;
-
-  unsigned OrigWidth = getValueWidth(&Sel);
   unsigned TargetWidth = Plan.ChosenWidths[C.ID];
-  if (TargetWidth <= OrigWidth)
+  if (TargetWidth <= C.OrigWidth)
     return false;
+
+  DenseSet<const Value *> ComponentValues;
+  for (Value *V : C.Values)
+    ComponentValues.insert(V);
+
+  for (Instruction *I : C.Instructions)
+    if (!isWidenablePolyInstruction(*I))
+      return false;
 
   ExtKind Kind = ExtKind::None;
-  SmallVector<Instruction *, 8> ExtUsers;
-  for (User *U : Sel.users()) {
-    auto *I = dyn_cast<Instruction>(U);
-    if (!I)
-      return false;
+  SmallVector<ExternalExtUser, 8> ExtUsers;
+  for (Value *V : C.Values) {
+    for (User *U : V->users()) {
+      auto *UserI = dyn_cast<Instruction>(U);
+      if (!UserI)
+        return false;
+      if (ComponentValues.count(UserI))
+        continue;
 
-    ExtKind UserKind = ExtKind::None;
-    if (auto *Z = dyn_cast<ZExtInst>(I)) {
-      if (Z->getOperand(0) != &Sel || getValueWidth(Z) != TargetWidth)
+      ExtKind UserKind = ExtKind::None;
+      if (auto *Z = dyn_cast<ZExtInst>(UserI)) {
+        if (Z->getOperand(0) != V || getValueWidth(Z) != TargetWidth)
+          return false;
+        UserKind = ExtKind::ZExt;
+      } else if (auto *S = dyn_cast<SExtInst>(UserI)) {
+        if (S->getOperand(0) != V || getValueWidth(S) != TargetWidth)
+          return false;
+        UserKind = ExtKind::SExt;
+      } else {
         return false;
-      UserKind = ExtKind::ZExt;
-    } else if (auto *S = dyn_cast<SExtInst>(I)) {
-      if (S->getOperand(0) != &Sel || getValueWidth(S) != TargetWidth)
+      }
+
+      if (Kind == ExtKind::None)
+        Kind = UserKind;
+      else if (Kind != UserKind)
         return false;
-      UserKind = ExtKind::SExt;
-    } else {
-      return false;
+
+      ExtUsers.push_back(ExternalExtUser{UserI, V});
     }
-
-    if (Kind == ExtKind::None)
-      Kind = UserKind;
-    else if (Kind != UserKind)
-      return false;
-
-    ExtUsers.push_back(I);
   }
 
   if (Kind == ExtKind::None || ExtUsers.empty())
     return false;
 
-  Value *WideTV =
-      materializeValueAtWidth(Sel.getTrueValue(), Kind, TargetWidth, &Sel);
-  Value *WideFV =
-      materializeValueAtWidth(Sel.getFalseValue(), Kind, TargetWidth, &Sel);
+  auto *TargetTy = IntegerType::get(C.Instructions.front()->getContext(),
+                                    TargetWidth);
+  DenseMap<Value *, Value *> NewValues;
 
-  IRBuilder<> B(&Sel);
-  auto *WideSel =
-      cast<SelectInst>(B.CreateSelect(Sel.getCondition(), WideTV, WideFV, ""));
-  WideSel->setDebugLoc(Sel.getDebugLoc());
-  WideSel->takeName(&Sel);
-
-  for (Instruction *Ext : ExtUsers) {
-    Ext->replaceAllUsesWith(WideSel);
-    Ext->eraseFromParent();
+  for (Instruction *I : C.Instructions) {
+    if (auto *Phi = dyn_cast<PHINode>(I)) {
+      auto *NewPhi = PHINode::Create(TargetTy, Phi->getNumIncomingValues(), "",
+                                     Phi->getIterator());
+      NewPhi->setDebugLoc(Phi->getDebugLoc());
+      NewPhi->takeName(Phi);
+      NewValues[Phi] = NewPhi;
+    }
   }
 
-  if (Sel.use_empty()) {
-    Sel.eraseFromParent();
-    return true;
+  for (Instruction *I : C.Instructions) {
+    auto *Phi = dyn_cast<PHINode>(I);
+    if (!Phi)
+      continue;
+    auto *NewPhi = cast<PHINode>(NewValues[Phi]);
+    for (unsigned Idx = 0, E = Phi->getNumIncomingValues(); Idx != E; ++Idx) {
+      Value *Incoming = Phi->getIncomingValue(Idx);
+      BasicBlock *Pred = Phi->getIncomingBlock(Idx);
+      Value *WideIncoming = nullptr;
+      if (ComponentValues.count(Incoming))
+        WideIncoming = NewValues.lookup(Incoming);
+      else
+        WideIncoming =
+            materializeValueAtWidth(Incoming, Kind, TargetWidth,
+                                    Pred->getTerminator());
+      if (WideIncoming == nullptr)
+        return false;
+      NewPhi->addIncoming(WideIncoming, Pred);
+    }
   }
 
-  WideSel->eraseFromParent();
-  return false;
+  unsigned Remaining = 0;
+  for (Instruction *I : C.Instructions)
+    if (!isa<PHINode>(I))
+      ++Remaining;
+
+  while (Remaining != 0) {
+    bool Progress = false;
+    for (Instruction *I : C.Instructions) {
+      if (isa<PHINode>(I) || NewValues.count(I))
+        continue;
+
+      if (auto *Sel = dyn_cast<SelectInst>(I)) {
+        auto getWideValue = [&](Value *V) -> Value * {
+          if (ComponentValues.count(V))
+            return NewValues.lookup(V);
+          return materializeValueAtWidth(V, Kind, TargetWidth, Sel);
+        };
+
+        Value *WideTV = getWideValue(Sel->getTrueValue());
+        Value *WideFV = getWideValue(Sel->getFalseValue());
+        if (!WideTV || !WideFV)
+          continue;
+
+        IRBuilder<> B(Sel);
+        auto *WideSel = cast<SelectInst>(
+            B.CreateSelect(Sel->getCondition(), WideTV, WideFV, ""));
+        WideSel->setDebugLoc(Sel->getDebugLoc());
+        WideSel->takeName(Sel);
+        NewValues[Sel] = WideSel;
+        Progress = true;
+        --Remaining;
+        continue;
+      }
+
+      if (auto *Fr = dyn_cast<FreezeInst>(I)) {
+        Value *Op = Fr->getOperand(0);
+        Value *WideOp = nullptr;
+        if (ComponentValues.count(Op))
+          WideOp = NewValues.lookup(Op);
+        else
+          WideOp = materializeValueAtWidth(Op, Kind, TargetWidth, Fr);
+        if (!WideOp)
+          continue;
+
+        IRBuilder<> B(Fr);
+        auto *WideFreeze = cast<Instruction>(B.CreateFreeze(WideOp));
+        WideFreeze->setDebugLoc(Fr->getDebugLoc());
+        WideFreeze->takeName(Fr);
+        NewValues[Fr] = WideFreeze;
+        Progress = true;
+        --Remaining;
+        continue;
+      }
+
+      return false;
+    }
+
+    if (!Progress)
+      return false;
+  }
+
+  for (const ExternalExtUser &EU : ExtUsers) {
+    Value *NewV = NewValues.lookup(EU.OldValue);
+    if (!NewV)
+      return false;
+    EU.Ext->replaceAllUsesWith(NewV);
+    EU.Ext->eraseFromParent();
+  }
+
+  for (Instruction *I : C.Instructions)
+    if (!I->use_empty())
+      I->replaceAllUsesWith(PoisonValue::get(I->getType()));
+  for (Instruction *I : C.Instructions)
+    I->eraseFromParent();
+
+  return true;
 }
 
 } // namespace
@@ -1216,25 +1244,8 @@ PreservedAnalyses WidthOptPass::run(Function &F, FunctionAnalysisManager &AM) {
   AnalysisResult R = computeWidthComponents(F);
   PlanResult Plan = computeWidthPlan(R);
 
-  SmallVector<PHINode *, 16> PhiWidenWorklist;
-  SmallVector<SelectInst *, 16> SelectWidenWorklist;
-  for (Instruction &I : instructions(F))
-    if (auto *Phi = dyn_cast<PHINode>(&I))
-      PhiWidenWorklist.push_back(Phi);
-    else if (auto *Sel = dyn_cast<SelectInst>(&I))
-      SelectWidenWorklist.push_back(Sel);
-
-  for (PHINode *Phi : PhiWidenWorklist) {
-    if (Phi->getParent() == nullptr)
-      continue;
-    Changed |= tryWidenPhiFromPlan(*Phi, R, Plan);
-  }
-
-  for (SelectInst *Sel : SelectWidenWorklist) {
-    if (Sel->getParent() == nullptr)
-      continue;
-    Changed |= tryWidenSelectFromPlan(*Sel, R, Plan);
-  }
+  for (const Component &C : R.Components)
+    Changed |= tryWidenComponentFromPlan(C, R, Plan);
 
   if (!Changed)
     return PreservedAnalyses::all();
