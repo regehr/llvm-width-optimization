@@ -26,6 +26,7 @@ endif()
 list(APPEND CMAKE_PREFIX_PATH "${WO_LLVM_INSTALL_DIR}/lib/cmake/llvm/")
 
 find_package(LLVM CONFIG)
+find_package(Python3 REQUIRED COMPONENTS Interpreter)
 
 message(STATUS "Found LLVM ${LLVM_PACKAGE_VERSION}")
 message(STATUS "Using LLVMConfig.cmake in: ${WO_LLVM_INSTALL_DIR}")
@@ -33,6 +34,26 @@ message(STATUS "Using LLVMConfig.cmake in: ${WO_LLVM_INSTALL_DIR}")
 include_directories(SYSTEM ${LLVM_INCLUDE_DIRS})
 link_directories(${LLVM_LIBRARY_DIRS})
 add_definitions(${LLVM_DEFINITIONS})
+
+find_program(
+  WO_LLVM_OPT
+  NAMES opt
+  HINTS
+    "${WO_LLVM_INSTALL_DIR}/bin"
+    "${LLVM_TOOLS_BINARY_DIR}"
+    "${LLVM_BINARY_DIR}/bin"
+  REQUIRED
+)
+
+find_program(
+  WO_LLVM_LIT
+  NAMES llvm-lit lit
+  HINTS
+    "${WO_LLVM_INSTALL_DIR}/bin"
+    "${LLVM_TOOLS_BINARY_DIR}"
+    "${LLVM_BINARY_DIR}/bin"
+  REQUIRED
+)
 
 set(CMAKE_CXX_STANDARD 17 CACHE STRING "")
 
@@ -59,3 +80,21 @@ set(CMAKE_LIBRARY_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}/lib")
 
 add_subdirectory(lib)
 add_subdirectory(test)
+
+add_custom_target(
+  check
+  COMMAND
+    "${Python3_EXECUTABLE}"
+    "${PROJECT_SOURCE_DIR}/scripts/run_lit.py"
+    --llvm-lit "${WO_LLVM_LIT}"
+    "${PROJECT_BINARY_DIR}/test"
+  COMMAND
+    "${Python3_EXECUTABLE}"
+    "${PROJECT_SOURCE_DIR}/scripts/run_width_opt_smoke.py"
+    --repo-root "${PROJECT_SOURCE_DIR}"
+    --opt-bin "${WO_LLVM_OPT}"
+    --plugin "$<TARGET_FILE:WidthOpt>"
+    --dir test
+  DEPENDS WidthOpt
+  VERBATIM
+)
