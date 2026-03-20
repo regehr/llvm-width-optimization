@@ -3,16 +3,18 @@
 
 declare i16 @g(i16)
 
-define i16 @f(i16, ptr %p, ptr %fp) {
+define i16 @f(i16 %x, ptr %p, ptr %fp) {
 entry:
-  %0 = load i16, ptr %p, align 2
-  %1 = ptrtoint ptr %p to i64
-  %2 = trunc i64 %1 to i16
-  %3 = call i16 @g(i16 %0)
-  %4 = load ptr, ptr %fp, align 8
-  %5 = call i16 %4(i16 %0)
-  %6 = add i16 %0, %3
-  ret i16 %6
+  %ld = load i16, ptr %p, align 2
+  %pi = ptrtoint ptr %p to i64
+  %tr = trunc i64 %pi to i16
+  %call.fixed = call i16 @g(i16 %ld)
+  %callee = load ptr, ptr %fp, align 8
+  %call.indirect = call i16 %callee(i16 %ld)
+  %sum0 = add i16 %ld, %call.fixed
+  %sum1 = add i16 %sum0, %call.indirect
+  %sum2 = add i16 %sum1, %tr
+  ret i16 %sum2
 }
 
 ; CHECK: Width components for function 'f':
