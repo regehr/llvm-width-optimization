@@ -1294,6 +1294,9 @@ bool tryShrinkTruncOfSelect(TruncInst &Tr) {
   auto *Sel = dyn_cast<SelectInst>(Tr.getOperand(0));
   if (!Sel || !Sel->hasOneUse())
     return false;
+  if (!isIntegerValue(&Tr) || !isIntegerValue(Sel) ||
+      !isIntegerValue(Sel->getTrueValue()) || !isIntegerValue(Sel->getFalseValue()))
+    return false;
 
   unsigned TargetWidth = getValueWidth(&Tr);
   unsigned SourceWidth = getValueWidth(Sel);
