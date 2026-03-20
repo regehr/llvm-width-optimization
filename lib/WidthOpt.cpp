@@ -672,6 +672,8 @@ void inferCandidatesFromInstruction(Instruction &I, AnalysisResult &R) {
   if (auto *Ext = dyn_cast<ZExtInst>(&I)) {
     unsigned SrcW = getValueWidth(Ext->getOperand(0));
     unsigned DstW = getValueWidth(Ext);
+    if (SrcW == 1 || DstW == 1)
+      return;
     unsigned DstID = R.ValueToComponent.lookup(Ext);
     unsigned SrcID = R.ValueToComponent.lookup(Ext->getOperand(0));
     addCandidateWidth(R.Components[DstID], SrcW);
@@ -682,6 +684,8 @@ void inferCandidatesFromInstruction(Instruction &I, AnalysisResult &R) {
   if (auto *Ext = dyn_cast<SExtInst>(&I)) {
     unsigned SrcW = getValueWidth(Ext->getOperand(0));
     unsigned DstW = getValueWidth(Ext);
+    if (SrcW == 1 || DstW == 1)
+      return;
     unsigned DstID = R.ValueToComponent.lookup(Ext);
     unsigned SrcID = R.ValueToComponent.lookup(Ext->getOperand(0));
     addCandidateWidth(R.Components[DstID], SrcW);
@@ -692,6 +696,8 @@ void inferCandidatesFromInstruction(Instruction &I, AnalysisResult &R) {
   if (auto *Tr = dyn_cast<TruncInst>(&I)) {
     unsigned SrcW = getValueWidth(Tr->getOperand(0));
     unsigned DstW = getValueWidth(Tr);
+    if (SrcW == 1 || DstW == 1)
+      return;
     unsigned DstID = R.ValueToComponent.lookup(Tr);
     unsigned SrcID = R.ValueToComponent.lookup(Tr->getOperand(0));
     addCandidateWidth(R.Components[DstID], SrcW);
@@ -770,6 +776,10 @@ unsigned edgeCutCost(unsigned FromWidth, unsigned ToWidth) {
   return FromWidth == ToWidth ? 0u : 1u;
 }
 
+unsigned compareAffinityCost(unsigned LHSWidth, unsigned RHSWidth) {
+  return LHSWidth == RHSWidth ? 0u : 1u;
+}
+
 unsigned scoreWidthChoice(const AnalysisResult &R,
                           ArrayRef<unsigned> ChosenWidths,
                           unsigned ComponentID, unsigned Width) {
@@ -779,6 +789,17 @@ unsigned scoreWidthChoice(const AnalysisResult &R,
       Score += edgeCutCost(Width, ChosenWidths[E.To]);
     else if (E.To == ComponentID)
       Score += edgeCutCost(ChosenWidths[E.From], Width);
+  }
+  // Compares do not define a common-width component because their result is
+  // i1, but they still create pressure for their integer operands to agree on
+  // one width. Model that as a symmetric affinity in the planner.
+  for (const CompareAffinity &A : R.CompareAffinities) {
+    assert(A.LHS < ChosenWidths.size() && A.RHS < ChosenWidths.size() &&
+           "Compare affinities should reference valid component IDs");
+    if (A.LHS == ComponentID)
+      Score += compareAffinityCost(Width, ChosenWidths[A.RHS]);
+    else if (A.RHS == ComponentID)
+      Score += compareAffinityCost(ChosenWidths[A.LHS], Width);
   }
   return Score;
 }
@@ -857,6 +878,12 @@ PlanResult computeWidthPlan(const AnalysisResult &R) {
   for (const ComponentEdge &E : R.Edges)
     Plan.TotalCutCost +=
         edgeCutCost(Plan.ChosenWidths[E.From], Plan.ChosenWidths[E.To]);
+  for (const CompareAffinity &A : R.CompareAffinities) {
+    assert(A.LHS < Plan.ChosenWidths.size() && A.RHS < Plan.ChosenWidths.size() &&
+           "Compare affinities should reference valid component IDs");
+    Plan.TotalCutCost +=
+        compareAffinityCost(Plan.ChosenWidths[A.LHS], Plan.ChosenWidths[A.RHS]);
+  }
 
   return Plan;
 }
@@ -907,6 +934,11 @@ AnalysisResult computeWidthComponents(Function &F) {
     Component &C = R.Components[ID];
     C.OrigWidth = std::max(C.OrigWidth, getValueWidth(V));
     C.Fixed |= isAnchorValue(V);
+    // Boolean-producing instructions are outside the current global width
+    // search space. We may still track them for analysis/printing, but the
+    // planner should not try to widen or narrow them.
+    if (getValueWidth(V) == 1)
+      C.Fixed = true;
     C.Values.push_back(const_cast<Value *>(V));
     if (auto *I = dyn_cast<Instruction>(const_cast<Value *>(V))) {
       C.Instructions.push_back(I);
@@ -916,6 +948,7 @@ AnalysisResult computeWidthComponents(Function &F) {
   }
 
   DenseSet<uint64_t> SeenEdges;
+  DenseSet<uint64_t> SeenCompareAffinities;
   for (Instruction &I : instructions(F)) {
     for (Value *Op : I.operands()) {
       if (!shouldTrackValue(Op))
@@ -929,6 +962,24 @@ AnalysisResult computeWidthComponents(Function &F) {
       uint64_t Key = (uint64_t(FromIt->second) << 32) | uint64_t(ToIt->second);
       if (SeenEdges.insert(Key).second)
         R.Edges.push_back(ComponentEdge{FromIt->second, ToIt->second});
+    }
+
+    if (auto *Cmp = dyn_cast<ICmpInst>(&I)) {
+      Value *LHS = Cmp->getOperand(0);
+      Value *RHS = Cmp->getOperand(1);
+      if (shouldTrackValue(LHS) && shouldTrackValue(RHS)) {
+        auto LHSIt = R.ValueToComponent.find(LHS);
+        auto RHSIt = R.ValueToComponent.find(RHS);
+        if (LHSIt != R.ValueToComponent.end() &&
+            RHSIt != R.ValueToComponent.end() &&
+            LHSIt->second != RHSIt->second) {
+          unsigned A = std::min(LHSIt->second, RHSIt->second);
+          unsigned B = std::max(LHSIt->second, RHSIt->second);
+          uint64_t Key = (uint64_t(A) << 32) | uint64_t(B);
+          if (SeenCompareAffinities.insert(Key).second)
+            R.CompareAffinities.push_back(CompareAffinity{A, B});
+        }
+      }
     }
 
     inferCandidatesFromInstruction(I, R);
@@ -1350,6 +1401,9 @@ PreservedAnalyses WidthPlanPrinter::run(Function &F,
     }
     OS << "\n";
   }
+
+  for (const CompareAffinity &A : R.CompareAffinities)
+    OS << formatv("  compare-affinity {0} <-> {1}\n", A.LHS, A.RHS);
 
   return PreservedAnalyses::all();
 }

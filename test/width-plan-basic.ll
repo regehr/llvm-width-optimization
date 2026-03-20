@@ -13,4 +13,4 @@ entry:
 ; CHECK: Width plan for function 'f':
 ; CHECK-DAG: component {{[0-9]+}}: orig=i8, fixed=true, chosen=i8, candidates=i8,i16
 ; CHECK-DAG: component {{[0-9]+}}: orig=i16, fixed=false, chosen=i8, candidates=i8,i16
-; CHECK-DAG: component {{[0-9]+}}: orig=i1, fixed=false, chosen=i1, candidates=i1
+; CHECK-DAG: component {{[0-9]+}}: orig=i1, fixed=true, chosen=i1, candidates=i1

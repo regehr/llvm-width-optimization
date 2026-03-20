@@ -13,5 +13,5 @@ entry:
 ; CHECK: Width candidates for function 'f':
 ; CHECK-DAG: component {{[0-9]+}}: orig=i8, fixed=true, candidates=i8,i16
 ; CHECK-DAG: component {{[0-9]+}}: orig=i16, fixed=false, candidates=i8,i16
-; CHECK-DAG: component {{[0-9]+}}: orig=i1, fixed=false, candidates=i1
+; CHECK-DAG: component {{[0-9]+}}: orig=i1, fixed=true, candidates=i1
 ; CHECK: edge {{[0-9]+}} -> {{[0-9]+}}

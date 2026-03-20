@@ -14,6 +14,6 @@ entry:
 ; CHECK-DAG: component {{[0-9]+}}: width=i8, fixed=true
 ; CHECK-DAG: component {{[0-9]+}}: width=i8, fixed=true
 ; CHECK-DAG: component {{[0-9]+}}: width=i16, fixed=false
-; CHECK-DAG: component {{[0-9]+}}: width=i1, fixed=false
+; CHECK-DAG: component {{[0-9]+}}: width=i1, fixed=true
 ; CHECK-DAG: %cmp [conditional]
 ; CHECK-DAG: %sel [poly]

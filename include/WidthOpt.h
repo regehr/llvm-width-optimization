@@ -36,10 +36,16 @@ struct ComponentEdge {
   unsigned To = 0;
 };
 
+struct CompareAffinity {
+  unsigned LHS = 0;
+  unsigned RHS = 0;
+};
+
 struct AnalysisResult {
   llvm::DenseMap<const llvm::Value *, unsigned> ValueToComponent;
   llvm::SmallVector<Component, 8> Components;
   llvm::SmallVector<ComponentEdge, 16> Edges;
+  llvm::SmallVector<CompareAffinity, 8> CompareAffinities;
 };
 
 struct PlanResult {
