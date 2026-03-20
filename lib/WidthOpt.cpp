@@ -16,12 +16,14 @@
 #include "llvm/IR/Function.h"
 #include "llvm/IR/InstIterator.h"
 #include "llvm/IR/Instructions.h"
+#include "llvm/IR/Module.h"
 #include "llvm/IR/Intrinsics.h"
 #include "llvm/IR/PassManager.h"
 #include "llvm/Passes/PassBuilder.h"
 #include "llvm/Plugins/PassPlugin.h"
 #include "llvm/Support/FormatVariadic.h"
 #include "llvm/Support/raw_ostream.h"
+#include "llvm/Transforms/Scalar/ADCE.h"
 #include "llvm/Transforms/Utils/Local.h"
 #include <cassert>
 #include <optional>
@@ -211,6 +213,47 @@ std::string formatValue(const Value *V) {
   else
     V->printAsOperand(OS, false);
   return S;
+}
+
+unsigned countModuleInstructions(const Module &M) {
+  unsigned Count = 0;
+  for (const Function &F : M) {
+    if (F.isDeclaration())
+      continue;
+    for (const Instruction &I : instructions(F)) {
+      (void)I;
+      ++Count;
+    }
+  }
+  return Count;
+}
+
+class ModuleInstructionCountPrinterPass
+    : public PassInfoMixin<ModuleInstructionCountPrinterPass> {
+  raw_ostream &OS;
+  std::string Stage;
+
+public:
+  ModuleInstructionCountPrinterPass(raw_ostream &OS, StringRef Stage)
+      : OS(OS), Stage(Stage.str()) {}
+
+  PreservedAnalyses run(Module &M, ModuleAnalysisManager &) {
+    OS << "WidthOpt module instruction count for '" << M.getName()
+       << "' after " << Stage << ": " << countModuleInstructions(M) << "\n";
+    return PreservedAnalyses::all();
+  }
+};
+
+FunctionPassManager createWidthOptMainPassManager() {
+  FunctionPassManager FPM;
+  FPM.addPass(WidthOptPass());
+  return FPM;
+}
+
+FunctionPassManager createADCEPassManager() {
+  FunctionPassManager FPM;
+  FPM.addPass(ADCEPass());
+  return FPM;
 }
 
 void addCandidateWidth(Component &C, unsigned W) {
@@ -838,6 +881,26 @@ unsigned getUnsignedRangeWidth(const Use &OperandUse, LazyValueInfo &LVI) {
   return std::max(1u, Bits);
 }
 
+enum class NarrowUDivOperandKind {
+  Existing,
+  NewZExt,
+  NewTrunc,
+};
+
+struct NarrowUDivOperandPlan {
+  NarrowUDivOperandKind Kind = NarrowUDivOperandKind::Existing;
+  Value *Source = nullptr;
+  Instruction *RemovableBoundary = nullptr;
+  unsigned AddedBoundaryCost = 0;
+  unsigned RemovedBoundaryCost = 0;
+};
+
+struct NarrowUDivResultPlan {
+  TruncInst *TruncUser = nullptr;
+  unsigned AddedBoundaryCost = 0;
+  unsigned RemovedBoundaryCost = 0;
+};
+
 bool tryNarrowUDivWithRange(BinaryOperator &BO, LazyValueInfo &LVI) {
   assert(BO.getOpcode() == Instruction::UDiv &&
          "UDiv narrowing expects a udiv instruction");
@@ -852,20 +915,130 @@ bool tryNarrowUDivWithRange(BinaryOperator &BO, LazyValueInfo &LVI) {
   if (TargetWidth >= OrigWidth)
     return false;
 
-  // For unsigned division, proving both operands fit in a smaller width is
-  // enough to run the division there and zero-extend the quotient back.
+  auto planOperand = [&](unsigned OperandIdx) -> std::optional<NarrowUDivOperandPlan> {
+    Value *V = BO.getOperand(OperandIdx);
+
+    if (auto *C = dyn_cast<ConstantInt>(V)) {
+      if (!canRepresentConstant(*C, ExtKind::ZExt, TargetWidth))
+        return std::nullopt;
+      return NarrowUDivOperandPlan{
+          NarrowUDivOperandKind::Existing,
+          convertConstantToNarrow(*C, TargetWidth),
+          nullptr,
+          0,
+          0,
+      };
+    }
+
+    if (auto Ext = getExtOperandInfo(V)) {
+      if (Ext->Kind != ExtKind::ZExt)
+        return std::nullopt;
+      if (Ext->NarrowWidth > TargetWidth)
+        return std::nullopt;
+
+      NarrowUDivOperandPlan Plan;
+      Plan.Source = Ext->NarrowValue;
+      if (Ext->Producer->hasOneUse()) {
+        Plan.RemovableBoundary = Ext->Producer;
+        Plan.RemovedBoundaryCost = 1;
+      }
+      if (Ext->NarrowWidth == TargetWidth)
+        return Plan;
+
+      Plan.Kind = NarrowUDivOperandKind::NewZExt;
+      Plan.AddedBoundaryCost = 1;
+      return Plan;
+    }
+
+    // Range facts can prove a narrower execution width, but they do not by
+    // themselves justify the rewrite. We only use them to legalize a truncation
+    // when enough existing boundary instructions around the udiv can be removed.
+    return NarrowUDivOperandPlan{
+        NarrowUDivOperandKind::NewTrunc,
+        V,
+        nullptr,
+        1,
+        0,
+    };
+  };
+
+  auto planResult = [&]() -> NarrowUDivResultPlan {
+    if (BO.hasOneUse()) {
+      if (auto *Tr = dyn_cast<TruncInst>(*BO.user_begin())) {
+        if (getValueWidth(Tr) == TargetWidth)
+          return NarrowUDivResultPlan{Tr, 0, 1};
+      }
+    }
+    return NarrowUDivResultPlan{nullptr, 1, 0};
+  };
+
+  auto LHSPlan = planOperand(0);
+  auto RHSPlan = planOperand(1);
+  if (!LHSPlan || !RHSPlan)
+    return false;
+  NarrowUDivResultPlan ResultPlan = planResult();
+
+  unsigned AddedBoundaryCost = LHSPlan->AddedBoundaryCost +
+                               RHSPlan->AddedBoundaryCost +
+                               ResultPlan.AddedBoundaryCost;
+  unsigned RemovedBoundaryCost = LHSPlan->RemovedBoundaryCost +
+                                 RHSPlan->RemovedBoundaryCost +
+                                 ResultPlan.RemovedBoundaryCost;
+
+  // Drive the rewrite from removable boundary instructions. A narrow udiv is
+  // worthwhile only if it strictly reduces the number of width changes around
+  // the region instead of merely moving or adding them.
+  if (RemovedBoundaryCost == 0 || AddedBoundaryCost >= RemovedBoundaryCost)
+    return false;
+
   IRBuilder<> B(&BO);
   auto *TargetTy = IntegerType::get(BO.getContext(), TargetWidth);
-  Value *NarrowLHS = B.CreateTrunc(BO.getOperand(0), TargetTy);
-  Value *NarrowRHS = B.CreateTrunc(BO.getOperand(1), TargetTy);
+
+  auto materializeOperand = [&](const NarrowUDivOperandPlan &Plan,
+                                const Twine &Name) -> Value * {
+    switch (Plan.Kind) {
+    case NarrowUDivOperandKind::Existing:
+      return Plan.Source;
+    case NarrowUDivOperandKind::NewZExt: {
+      auto *Z = cast<Instruction>(B.CreateZExt(Plan.Source, TargetTy, Name));
+      Z->setDebugLoc(BO.getDebugLoc());
+      return Z;
+    }
+    case NarrowUDivOperandKind::NewTrunc: {
+      auto *Tr = cast<Instruction>(B.CreateTrunc(Plan.Source, TargetTy, Name));
+      Tr->setDebugLoc(BO.getDebugLoc());
+      return Tr;
+    }
+    }
+    llvm_unreachable("Unexpected narrow udiv operand plan");
+  };
+
+  Value *NarrowLHS = materializeOperand(*LHSPlan, BO.getName() + ".lhs.narrow");
+  Value *NarrowRHS = materializeOperand(*RHSPlan, BO.getName() + ".rhs.narrow");
   auto *NarrowDiv = cast<Instruction>(
       B.CreateUDiv(NarrowLHS, NarrowRHS, BO.getName() + ".narrow"));
   NarrowDiv->setDebugLoc(BO.getDebugLoc());
-  auto *WideDiv = cast<Instruction>(B.CreateZExt(NarrowDiv, BO.getType(), BO.getName()));
-  WideDiv->setDebugLoc(BO.getDebugLoc());
+  if (BO.isExact())
+    NarrowDiv->setIsExact(true);
 
-  BO.replaceAllUsesWith(WideDiv);
+  if (ResultPlan.TruncUser != nullptr) {
+    ResultPlan.TruncUser->replaceAllUsesWith(NarrowDiv);
+    ResultPlan.TruncUser->eraseFromParent();
+  } else {
+    auto *WideDiv =
+        cast<Instruction>(B.CreateZExt(NarrowDiv, BO.getType(), BO.getName()));
+    WideDiv->setDebugLoc(BO.getDebugLoc());
+    BO.replaceAllUsesWith(WideDiv);
+  }
   BO.eraseFromParent();
+
+  auto tryDeleteBoundary = [](Instruction *I) {
+    if (I != nullptr && I->use_empty())
+      RecursivelyDeleteTriviallyDeadInstructions(I);
+  };
+  tryDeleteBoundary(LHSPlan->RemovableBoundary);
+  tryDeleteBoundary(RHSPlan->RemovableBoundary);
+
   return true;
 }
 
@@ -2146,10 +2319,6 @@ PassPluginLibraryInfo getWidthOptPluginInfo() {
             PB.registerPipelineParsingCallback(
                 [](StringRef Name, FunctionPassManager &FPM,
                    ArrayRef<PassBuilder::PipelineElement>) {
-                  if (Name == "width-opt") {
-                    FPM.addPass(WidthOptPass());
-                    return true;
-                  }
                   if (Name == "print<width-components>") {
                     FPM.addPass(WidthComponentPrinter(errs()));
                     return true;
@@ -2163,6 +2332,25 @@ PassPluginLibraryInfo getWidthOptPluginInfo() {
                     return true;
                   }
                   return false;
+                });
+
+            PB.registerPipelineParsingCallback(
+                [](StringRef Name, ModulePassManager &MPM,
+                   ArrayRef<PassBuilder::PipelineElement>) {
+                  if (Name != "width-opt")
+                    return false;
+
+                  MPM.addPass(
+                      createModuleToFunctionPassAdaptor(createADCEPassManager()));
+                  MPM.addPass(
+                      ModuleInstructionCountPrinterPass(errs(), "initial ADCE"));
+                  MPM.addPass(createModuleToFunctionPassAdaptor(
+                      createWidthOptMainPassManager()));
+                  MPM.addPass(
+                      createModuleToFunctionPassAdaptor(createADCEPassManager()));
+                  MPM.addPass(
+                      ModuleInstructionCountPrinterPass(errs(), "final ADCE"));
+                  return true;
                 });
           }};
 }

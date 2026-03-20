@@ -66,7 +66,8 @@ rewrites that complement the planner.
   - `add`
   - `select`
   - simple loop-carried `shl` recurrences
-- range-driven `udiv` narrowing
+- `udiv` retargeting when range facts and removable width changes make it
+  profitable
 - local widening of `zext -> add -> zext` chains to reuse an existing wider
   extension path
 - plan-driven widening of components built from `phi`, `select`, `freeze`,
