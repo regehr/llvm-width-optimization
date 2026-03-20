@@ -63,22 +63,21 @@ struct ExtOperandInfo {
   unsigned WideWidth = 0;
 };
 
-static IntegerType *getIntegerTy(Value *V) {
+IntegerType *getIntegerTy(Value *V) {
   return dyn_cast<IntegerType>(V->getType());
 }
 
-static bool isIntegerValue(Value *V) {
+bool isIntegerValue(Value *V) {
   return getIntegerTy(V) != nullptr;
 }
 
-static void unionIfInteger(EquivalenceClasses<const Value *> &EC, Value *A,
-                           Value *B) {
+void unionIfInteger(EquivalenceClasses<const Value *> &EC, Value *A, Value *B) {
   if (!isIntegerValue(A) || !isIntegerValue(B))
     return;
   EC.unionSets(A, B);
 }
 
-static bool hasFixedIntegerSignature(const CallBase &CB) {
+bool hasFixedIntegerSignature(const CallBase &CB) {
   if (CB.getCalledFunction() == nullptr)
     return true;
 
@@ -102,7 +101,7 @@ static bool hasFixedIntegerSignature(const CallBase &CB) {
   return true;
 }
 
-static InstClass classifyInstruction(Instruction &I) {
+InstClass classifyInstruction(Instruction &I) {
   if (!isIntegerValue(&I))
     return InstClass::Ignore;
 
@@ -150,8 +149,8 @@ static InstClass classifyInstruction(Instruction &I) {
   return InstClass::HardAnchor;
 }
 
-static void addEqualWidthConstraints(Instruction &I,
-                                     EquivalenceClasses<const Value *> &EC) {
+void addEqualWidthConstraints(Instruction &I,
+                              EquivalenceClasses<const Value *> &EC) {
   if (!isIntegerValue(&I))
     return;
 
@@ -179,22 +178,22 @@ static void addEqualWidthConstraints(Instruction &I,
   }
 }
 
-static bool isAnchorValue(const Value *V) {
+bool isAnchorValue(const Value *V) {
   if (auto *Arg = dyn_cast<Argument>(V))
     return isa<IntegerType>(Arg->getType());
   return false;
 }
 
-static bool shouldTrackValue(const Value *V) {
+bool shouldTrackValue(const Value *V) {
   return isa<IntegerType>(V->getType()) &&
          (isa<Instruction>(V) || isa<Argument>(V));
 }
 
-static unsigned getValueWidth(const Value *V) {
+unsigned getValueWidth(const Value *V) {
   return cast<IntegerType>(V->getType())->getBitWidth();
 }
 
-static std::string formatValue(const Value *V) {
+std::string formatValue(const Value *V) {
   std::string S;
   raw_string_ostream OS(S);
   if (V->hasName())
@@ -204,7 +203,7 @@ static std::string formatValue(const Value *V) {
   return S;
 }
 
-static void addCandidateWidth(Component &C, unsigned W) {
+void addCandidateWidth(Component &C, unsigned W) {
   if (W == 0)
     return;
   if (llvm::is_contained(C.CandidateWidths, W))
@@ -212,7 +211,7 @@ static void addCandidateWidth(Component &C, unsigned W) {
   C.CandidateWidths.push_back(W);
 }
 
-static std::optional<ExtOperandInfo> getExtOperandInfo(Value *V) {
+std::optional<ExtOperandInfo> getExtOperandInfo(Value *V) {
   if (auto *Z = dyn_cast<ZExtInst>(V)) {
     return ExtOperandInfo{Z->getOperand(0), Z, ExtKind::ZExt,
                           getValueWidth(Z->getOperand(0)), getValueWidth(Z)};
@@ -226,8 +225,7 @@ static std::optional<ExtOperandInfo> getExtOperandInfo(Value *V) {
   return std::nullopt;
 }
 
-static bool canRepresentConstant(ConstantInt &C, ExtKind Kind,
-                                 unsigned NarrowWidth) {
+bool canRepresentConstant(ConstantInt &C, ExtKind Kind, unsigned NarrowWidth) {
   APInt Narrow = C.getValue().trunc(NarrowWidth);
   switch (Kind) {
   case ExtKind::ZExt:
@@ -240,12 +238,12 @@ static bool canRepresentConstant(ConstantInt &C, ExtKind Kind,
   llvm_unreachable("Unexpected extension kind");
 }
 
-static Constant *convertConstantToNarrow(ConstantInt &C, unsigned NarrowWidth) {
+Constant *convertConstantToNarrow(ConstantInt &C, unsigned NarrowWidth) {
   return ConstantInt::get(IntegerType::get(C.getContext(), NarrowWidth),
                           C.getValue().trunc(NarrowWidth));
 }
 
-static bool areEquivalentValues(Value *A, Value *B) {
+bool areEquivalentValues(Value *A, Value *B) {
   if (A == B)
     return true;
 
@@ -258,21 +256,20 @@ static bool areEquivalentValues(Value *A, Value *B) {
          EA->WideWidth == EB->WideWidth && EA->NarrowValue == EB->NarrowValue;
 }
 
-static bool isEqOrNe(ICmpInst::Predicate Pred) {
+bool isEqOrNe(ICmpInst::Predicate Pred) {
   return Pred == ICmpInst::ICMP_EQ || Pred == ICmpInst::ICMP_NE;
 }
 
-static bool isUnsignedICmp(ICmpInst::Predicate Pred) {
+bool isUnsignedICmp(ICmpInst::Predicate Pred) {
   return ICmpInst::isUnsigned(Pred);
 }
 
-static bool isSignedICmp(ICmpInst::Predicate Pred) {
+bool isSignedICmp(ICmpInst::Predicate Pred) {
   return ICmpInst::isSigned(Pred);
 }
 
-static unsigned computeShrinkWidth(ICmpInst::Predicate Pred,
-                                   const ExtOperandInfo &LHS,
-                                   const ExtOperandInfo &RHS) {
+unsigned computeShrinkWidth(ICmpInst::Predicate Pred, const ExtOperandInfo &LHS,
+                            const ExtOperandInfo &RHS) {
   if (LHS.WideWidth != RHS.WideWidth)
     return 0;
 
@@ -300,8 +297,8 @@ static unsigned computeShrinkWidth(ICmpInst::Predicate Pred,
   return 0;
 }
 
-static Value *materializeAtWidth(IRBuilder<> &B, const ExtOperandInfo &Info,
-                                 unsigned TargetWidth) {
+Value *materializeAtWidth(IRBuilder<> &B, const ExtOperandInfo &Info,
+                          unsigned TargetWidth) {
   assert(TargetWidth >= Info.NarrowWidth && "Cannot shrink below source width");
 
   if (TargetWidth == Info.NarrowWidth)
@@ -316,7 +313,7 @@ static Value *materializeAtWidth(IRBuilder<> &B, const ExtOperandInfo &Info,
   llvm_unreachable("Unexpected extension kind");
 }
 
-static bool tryShrinkICmp(ICmpInst &Cmp) {
+bool tryShrinkICmp(ICmpInst &Cmp) {
   auto LHSInfo = getExtOperandInfo(Cmp.getOperand(0));
   auto RHSInfo = getExtOperandInfo(Cmp.getOperand(1));
   if (!LHSInfo || !RHSInfo)
@@ -349,9 +346,9 @@ static bool tryShrinkICmp(ICmpInst &Cmp) {
   return true;
 }
 
-static bool areHighBitsKnownZero(Value *V, unsigned NarrowWidth,
-                                 const DataLayout &DL, AssumptionCache *AC,
-                                 DominatorTree *DT, const Instruction *CxtI) {
+bool areHighBitsKnownZero(Value *V, unsigned NarrowWidth, const DataLayout &DL,
+                          AssumptionCache *AC, DominatorTree *DT,
+                          const Instruction *CxtI) {
   unsigned WideWidth = getValueWidth(V);
   if (NarrowWidth >= WideWidth)
     return true;
@@ -362,9 +359,8 @@ static bool areHighBitsKnownZero(Value *V, unsigned NarrowWidth,
   return (KB.Zero & HighBits) == HighBits;
 }
 
-static bool tryWidenTruncEqualityICmp(ICmpInst &Cmp, const DataLayout &DL,
-                                      AssumptionCache *AC,
-                                      DominatorTree *DT) {
+bool tryWidenTruncEqualityICmp(ICmpInst &Cmp, const DataLayout &DL,
+                               AssumptionCache *AC, DominatorTree *DT) {
   if (!isEqOrNe(Cmp.getPredicate()))
     return false;
 
@@ -400,17 +396,17 @@ static bool tryWidenTruncEqualityICmp(ICmpInst &Cmp, const DataLayout &DL,
   return true;
 }
 
-static bool isRelationalLess(ICmpInst::Predicate Pred) {
+bool isRelationalLess(ICmpInst::Predicate Pred) {
   return Pred == ICmpInst::ICMP_SLT || Pred == ICmpInst::ICMP_SLE ||
          Pred == ICmpInst::ICMP_ULT || Pred == ICmpInst::ICMP_ULE;
 }
 
-static bool isRelationalGreater(ICmpInst::Predicate Pred) {
+bool isRelationalGreater(ICmpInst::Predicate Pred) {
   return Pred == ICmpInst::ICMP_SGT || Pred == ICmpInst::ICMP_SGE ||
          Pred == ICmpInst::ICMP_UGT || Pred == ICmpInst::ICMP_UGE;
 }
 
-static MinMaxKind getMinMaxKind(ICmpInst::Predicate Pred, bool TrueIsLHS) {
+MinMaxKind getMinMaxKind(ICmpInst::Predicate Pred, bool TrueIsLHS) {
   if (isSignedICmp(Pred)) {
     if (isRelationalLess(Pred))
       return TrueIsLHS ? MinMaxKind::SMin : MinMaxKind::SMax;
@@ -430,7 +426,7 @@ static MinMaxKind getMinMaxKind(ICmpInst::Predicate Pred, bool TrueIsLHS) {
   return MinMaxKind::None;
 }
 
-static Intrinsic::ID getIntrinsicForMinMaxKind(MinMaxKind K) {
+Intrinsic::ID getIntrinsicForMinMaxKind(MinMaxKind K) {
   switch (K) {
   case MinMaxKind::SMin:
     return Intrinsic::smin;
@@ -446,7 +442,7 @@ static Intrinsic::ID getIntrinsicForMinMaxKind(MinMaxKind K) {
   llvm_unreachable("Unexpected min/max kind");
 }
 
-static bool tryConvertSelectToMinMax(SelectInst &Sel) {
+bool tryConvertSelectToMinMax(SelectInst &Sel) {
   auto *Ty = dyn_cast<IntegerType>(Sel.getType());
   if (!Ty)
     return false;
@@ -494,7 +490,7 @@ static bool tryConvertSelectToMinMax(SelectInst &Sel) {
   return true;
 }
 
-static bool tryShrinkPhiOfExts(PHINode &Phi) {
+bool tryShrinkPhiOfExts(PHINode &Phi) {
   auto *WideTy = dyn_cast<IntegerType>(Phi.getType());
   if (!WideTy)
     return false;
@@ -571,7 +567,7 @@ static bool tryShrinkPhiOfExts(PHINode &Phi) {
   return true;
 }
 
-static bool tryShrinkSelectOfExts(SelectInst &Sel) {
+bool tryShrinkSelectOfExts(SelectInst &Sel) {
   auto *WideTy = dyn_cast<IntegerType>(Sel.getType());
   if (!WideTy)
     return false;
@@ -644,7 +640,7 @@ static bool tryShrinkSelectOfExts(SelectInst &Sel) {
   return true;
 }
 
-static bool tryConvertSExtToNonNegZExt(SExtInst &Ext, LazyValueInfo &LVI) {
+bool tryConvertSExtToNonNegZExt(SExtInst &Ext, LazyValueInfo &LVI) {
   const Use &Base = Ext.getOperandUse(0);
   if (!LVI.getConstantRangeAtUse(Base, /*UndefAllowed=*/false).isAllNonNegative())
     return false;
@@ -659,8 +655,7 @@ static bool tryConvertSExtToNonNegZExt(SExtInst &Ext, LazyValueInfo &LVI) {
   return true;
 }
 
-static void inferCandidatesFromInstruction(Instruction &I,
-                                           AnalysisResult &R) {
+void inferCandidatesFromInstruction(Instruction &I, AnalysisResult &R) {
   if (auto *Ext = dyn_cast<ZExtInst>(&I)) {
     unsigned SrcW = getValueWidth(Ext->getOperand(0));
     unsigned DstW = getValueWidth(Ext);
@@ -718,17 +713,15 @@ static void inferCandidatesFromInstruction(Instruction &I,
   }
 }
 
-static Constant *extendConstant(ConstantInt &C, ExtKind Kind,
-                                unsigned TargetWidth) {
+Constant *extendConstant(ConstantInt &C, ExtKind Kind, unsigned TargetWidth) {
   APInt V = C.getValue();
   APInt NewV =
       Kind == ExtKind::ZExt ? V.zext(TargetWidth) : V.sext(TargetWidth);
   return ConstantInt::get(IntegerType::get(C.getContext(), TargetWidth), NewV);
 }
 
-static Value *materializeValueAtWidth(Value *V, ExtKind Kind,
-                                      unsigned TargetWidth,
-                                      Instruction *InsertBefore) {
+Value *materializeValueAtWidth(Value *V, ExtKind Kind, unsigned TargetWidth,
+                               Instruction *InsertBefore) {
   unsigned CurrentWidth = getValueWidth(V);
   if (CurrentWidth == TargetWidth)
     return V;
@@ -758,13 +751,13 @@ static Value *materializeValueAtWidth(Value *V, ExtKind Kind,
   llvm_unreachable("Unexpected extension kind");
 }
 
-static unsigned edgeCutCost(unsigned FromWidth, unsigned ToWidth) {
+unsigned edgeCutCost(unsigned FromWidth, unsigned ToWidth) {
   return FromWidth == ToWidth ? 0u : 1u;
 }
 
-static unsigned scoreWidthChoice(const AnalysisResult &R,
-                                 ArrayRef<unsigned> ChosenWidths,
-                                 unsigned ComponentID, unsigned Width) {
+unsigned scoreWidthChoice(const AnalysisResult &R,
+                          ArrayRef<unsigned> ChosenWidths,
+                          unsigned ComponentID, unsigned Width) {
   unsigned Score = 0;
   for (const ComponentEdge &E : R.Edges) {
     if (E.From == ComponentID)
@@ -775,16 +768,16 @@ static unsigned scoreWidthChoice(const AnalysisResult &R,
   return Score;
 }
 
-static bool preferOrigWidthOnTie(const Component &C) {
+bool preferOrigWidthOnTie(const Component &C) {
   return C.Instructions.size() == 1 &&
          (isa<ZExtInst>(C.Instructions.front()) ||
           isa<SExtInst>(C.Instructions.front()) ||
           isa<TruncInst>(C.Instructions.front()));
 }
 
-static bool isBetterWidthChoice(const Component &C, unsigned CandidateWidth,
-                                unsigned CandidateScore, unsigned BestWidth,
-                                unsigned BestScore) {
+bool isBetterWidthChoice(const Component &C, unsigned CandidateWidth,
+                         unsigned CandidateScore, unsigned BestWidth,
+                         unsigned BestScore) {
   if (CandidateScore != BestScore)
     return CandidateScore < BestScore;
   if (preferOrigWidthOnTie(C)) {
@@ -798,7 +791,7 @@ static bool isBetterWidthChoice(const Component &C, unsigned CandidateWidth,
   return false;
 }
 
-static PlanResult computeWidthPlan(const AnalysisResult &R) {
+PlanResult computeWidthPlan(const AnalysisResult &R) {
   PlanResult Plan;
   Plan.ChosenWidths.reserve(R.Components.size());
   for (const Component &C : R.Components)
@@ -845,7 +838,7 @@ static PlanResult computeWidthPlan(const AnalysisResult &R) {
   return Plan;
 }
 
-static AnalysisResult computeWidthComponents(Function &F) {
+AnalysisResult computeWidthComponents(Function &F) {
   EquivalenceClasses<const Value *> EC;
   DenseSet<const Value *> TrackedValues;
   for (Argument &Arg : F.args()) {
@@ -922,12 +915,12 @@ struct ExternalExtUser {
   Value *OldValue = nullptr;
 };
 
-static bool isWidenablePolyInstruction(Instruction &I) {
+bool isWidenablePolyInstruction(Instruction &I) {
   return isa<PHINode>(I) || isa<SelectInst>(I) || isa<FreezeInst>(I);
 }
 
-static bool tryWidenComponentFromPlan(const Component &C, const AnalysisResult &R,
-                                      const PlanResult &Plan) {
+bool tryWidenComponentFromPlan(const Component &C, const AnalysisResult &R,
+                               const PlanResult &Plan) {
   if (C.Fixed || C.Instructions.empty())
     return false;
 
@@ -943,7 +936,8 @@ static bool tryWidenComponentFromPlan(const Component &C, const AnalysisResult &
     if (!isWidenablePolyInstruction(*I))
       return false;
 
-  ExtKind Kind = ExtKind::None;
+  bool SawZExtToTarget = false;
+  bool SawSExtToTarget = false;
   SmallVector<ExternalExtUser, 8> ExternalUsers;
   for (Value *V : C.Values) {
     for (User *U : V->users()) {
@@ -954,18 +948,12 @@ static bool tryWidenComponentFromPlan(const Component &C, const AnalysisResult &
         continue;
 
       if (auto *Z = dyn_cast<ZExtInst>(UserI)) {
-        if (Z->getOperand(0) != V) 
+        if (Z->getOperand(0) != V)
           return false;
-        if (Kind == ExtKind::None)
-          Kind = ExtKind::ZExt;
-        else if (Kind != ExtKind::ZExt)
-          return false;
+        if (getValueWidth(Z) == TargetWidth)
+          SawZExtToTarget = true;
       } else if (auto *S = dyn_cast<SExtInst>(UserI)) {
         if (S->getOperand(0) != V)
-          return false;
-        if (Kind == ExtKind::None)
-          Kind = ExtKind::SExt;
-        else if (Kind != ExtKind::SExt)
           return false;
       }
 
@@ -973,8 +961,16 @@ static bool tryWidenComponentFromPlan(const Component &C, const AnalysisResult &
     }
   }
 
-  if (Kind == ExtKind::None || ExternalUsers.empty())
+  if (ExternalUsers.empty())
     return false;
+
+  for (const ExternalExtUser &EU : ExternalUsers)
+    if (auto *S = dyn_cast<SExtInst>(EU.User))
+      if (getValueWidth(S) == TargetWidth)
+        SawSExtToTarget = true;
+
+  ExtKind InternalKind =
+      SawSExtToTarget && !SawZExtToTarget ? ExtKind::SExt : ExtKind::ZExt;
 
   auto *TargetTy = IntegerType::get(C.Instructions.front()->getContext(),
                                     TargetWidth);
@@ -1003,7 +999,7 @@ static bool tryWidenComponentFromPlan(const Component &C, const AnalysisResult &
         WideIncoming = NewValues.lookup(Incoming);
       else
         WideIncoming =
-            materializeValueAtWidth(Incoming, Kind, TargetWidth,
+            materializeValueAtWidth(Incoming, InternalKind, TargetWidth,
                                     Pred->getTerminator());
       if (WideIncoming == nullptr)
         return false;
@@ -1026,7 +1022,7 @@ static bool tryWidenComponentFromPlan(const Component &C, const AnalysisResult &
         auto getWideValue = [&](Value *V) -> Value * {
           if (ComponentValues.count(V))
             return NewValues.lookup(V);
-          return materializeValueAtWidth(V, Kind, TargetWidth, Sel);
+          return materializeValueAtWidth(V, InternalKind, TargetWidth, Sel);
         };
 
         Value *WideTV = getWideValue(Sel->getTrueValue());
@@ -1051,7 +1047,7 @@ static bool tryWidenComponentFromPlan(const Component &C, const AnalysisResult &
         if (ComponentValues.count(Op))
           WideOp = NewValues.lookup(Op);
         else
-          WideOp = materializeValueAtWidth(Op, Kind, TargetWidth, Fr);
+          WideOp = materializeValueAtWidth(Op, InternalKind, TargetWidth, Fr);
         if (!WideOp)
           continue;
 
@@ -1078,37 +1074,23 @@ static bool tryWidenComponentFromPlan(const Component &C, const AnalysisResult &
       return false;
 
     if (auto *Z = dyn_cast<ZExtInst>(EU.User)) {
-      if (!Z->use_empty()) {
-        Value *Replacement =
-            materializeValueAtWidth(NewV, Kind, getValueWidth(Z), Z);
-        Z->replaceAllUsesWith(Replacement);
+      if (getValueWidth(Z) == TargetWidth && InternalKind == ExtKind::ZExt) {
+        Z->replaceAllUsesWith(NewV);
+        Z->eraseFromParent();
+        continue;
       }
-      Z->eraseFromParent();
-      continue;
     }
 
     if (auto *S = dyn_cast<SExtInst>(EU.User)) {
-      if (!S->use_empty()) {
-        Value *Replacement =
-            materializeValueAtWidth(NewV, Kind, getValueWidth(S), S);
-        S->replaceAllUsesWith(Replacement);
+      if (getValueWidth(S) == TargetWidth && InternalKind == ExtKind::SExt) {
+        S->replaceAllUsesWith(NewV);
+        S->eraseFromParent();
+        continue;
       }
-      S->eraseFromParent();
-      continue;
-    }
-
-    if (auto *T = dyn_cast<TruncInst>(EU.User)) {
-      if (!T->use_empty()) {
-        Value *Replacement =
-            materializeValueAtWidth(NewV, Kind, getValueWidth(T), T);
-        T->replaceAllUsesWith(Replacement);
-      }
-      T->eraseFromParent();
-      continue;
     }
 
     Value *Boundary =
-        materializeValueAtWidth(NewV, Kind, C.OrigWidth, EU.User);
+        materializeValueAtWidth(NewV, InternalKind, C.OrigWidth, EU.User);
     EU.User->replaceUsesOfWith(EU.OldValue, Boundary);
   }
 
@@ -1288,7 +1270,7 @@ PreservedAnalyses WidthOptPass::run(Function &F, FunctionAnalysisManager &AM) {
   return PreservedAnalyses::none();
 }
 
-static PassPluginLibraryInfo getWidthOptPluginInfo() {
+PassPluginLibraryInfo getWidthOptPluginInfo() {
   return {LLVM_PLUGIN_API_VERSION, "WidthOpt", LLVM_VERSION_STRING,
           [](PassBuilder &PB) {
             PB.registerAnalysisRegistrationCallback(
