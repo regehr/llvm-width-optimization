@@ -436,6 +436,77 @@ getRetargetedZeroComparePredicate(ICmpInst &Cmp, Value &WideV, ExtKind Kind,
   return getNarrowPredicateForZeroCompare(Pred, Kind);
 }
 
+std::optional<bool>
+getKnownCompareResultWithConstantLHS(ICmpInst::Predicate Pred,
+                                     const APInt &ConstValue) {
+  if (isUnsignedICmp(Pred)) {
+    switch (Pred) {
+    case ICmpInst::ICMP_ULT:
+      if (ConstValue.isMaxValue())
+        return false;
+      break;
+    case ICmpInst::ICMP_ULE:
+      if (ConstValue.isMinValue())
+        return true;
+      break;
+    case ICmpInst::ICMP_UGT:
+      if (ConstValue.isMinValue())
+        return false;
+      break;
+    case ICmpInst::ICMP_UGE:
+      if (ConstValue.isMaxValue())
+        return true;
+      break;
+    default:
+      break;
+    }
+    return std::nullopt;
+  }
+
+  if (isSignedICmp(Pred)) {
+    switch (Pred) {
+    case ICmpInst::ICMP_SLT:
+      if (ConstValue.isMaxSignedValue())
+        return false;
+      break;
+    case ICmpInst::ICMP_SLE:
+      if (ConstValue.isMinSignedValue())
+        return true;
+      break;
+    case ICmpInst::ICMP_SGT:
+      if (ConstValue.isMinSignedValue())
+        return false;
+      break;
+    case ICmpInst::ICMP_SGE:
+      if (ConstValue.isMaxSignedValue())
+        return true;
+      break;
+    default:
+      break;
+    }
+  }
+
+  return std::nullopt;
+}
+
+Value *buildConstantAwareICmp(IRBuilder<> &B, ICmpInst::Predicate Pred,
+                              Value *LHS, Value *RHS, const Twine &Name = "") {
+  if (auto *CLHS = dyn_cast<ConstantInt>(LHS)) {
+    if (auto Known = getKnownCompareResultWithConstantLHS(Pred, CLHS->getValue()))
+      return ConstantInt::getFalse(B.getContext())->getType() ==
+                     Type::getInt1Ty(B.getContext())
+                 ? ConstantInt::get(Type::getInt1Ty(B.getContext()), *Known)
+                 : nullptr;
+  }
+  if (auto *CRHS = dyn_cast<ConstantInt>(RHS)) {
+    ICmpInst::Predicate Swapped = ICmpInst::getSwappedPredicate(Pred);
+    if (auto Known =
+            getKnownCompareResultWithConstantLHS(Swapped, CRHS->getValue()))
+      return ConstantInt::get(Type::getInt1Ty(B.getContext()), *Known);
+  }
+  return B.CreateICmp(Pred, LHS, RHS, Name);
+}
+
 bool tryShrinkICmp(ICmpInst &Cmp) {
   auto LHSInfo = getExtOperandInfo(Cmp.getOperand(0));
   auto RHSInfo = getExtOperandInfo(Cmp.getOperand(1));
@@ -2230,12 +2301,62 @@ bool canRetargetBoundaryCompare(ICmpInst::Predicate Pred, ExtKind InternalKind) 
   return false;
 }
 
+bool tryRetargetExternalUnsignedCompareViaSelect(ICmpInst &Cmp,
+                                                 const DenseSet<const Value *> &ComponentValues,
+                                                 unsigned OrigWidth,
+                                                 ExtKind InternalKind) {
+  if (!isUnsignedICmp(Cmp.getPredicate()) || InternalKind != ExtKind::SExt)
+    return false;
+
+  int ComponentIdx = -1;
+  for (unsigned Idx = 0; Idx != 2; ++Idx) {
+    if (!ComponentValues.count(Cmp.getOperand(Idx)))
+      continue;
+    if (ComponentIdx != -1)
+      return false;
+    ComponentIdx = Idx;
+  }
+  if (ComponentIdx == -1)
+    return false;
+
+  auto *Sel = dyn_cast<SelectInst>(Cmp.getOperand(ComponentIdx));
+  if (!Sel || !isIntegerValue(Sel) || getValueWidth(Sel) != OrigWidth)
+    return false;
+
+  auto *TrueC = dyn_cast<ConstantInt>(Sel->getTrueValue());
+  auto *FalseC = dyn_cast<ConstantInt>(Sel->getFalseValue());
+  if (!TrueC || !FalseC)
+    return false;
+
+  Value *Other = Cmp.getOperand(1 - ComponentIdx);
+  if (!isIntegerValue(Other) || getValueWidth(Other) != OrigWidth ||
+      ComponentValues.count(Other))
+    return false;
+
+  IRBuilder<> B(&Cmp);
+  auto buildArm = [&](ConstantInt *C, const Twine &Name) -> Value * {
+    Value *LHS = ComponentIdx == 0 ? cast<Value>(C) : Other;
+    Value *RHS = ComponentIdx == 0 ? Other : cast<Value>(C);
+    return buildConstantAwareICmp(B, Cmp.getPredicate(), LHS, RHS, Name);
+  };
+
+  Value *TrueCmp = buildArm(TrueC, Cmp.getName() + ".true");
+  Value *FalseCmp = buildArm(FalseC, Cmp.getName() + ".false");
+  auto *NewSel = cast<SelectInst>(B.CreateSelect(Sel->getCondition(), TrueCmp,
+                                                 FalseCmp, Cmp.getName()));
+  NewSel->setDebugLoc(Cmp.getDebugLoc());
+  Cmp.replaceAllUsesWith(NewSel);
+  Cmp.eraseFromParent();
+  return true;
+}
+
 bool tryRetargetExternalICmp(ICmpInst &Cmp, const DenseSet<const Value *> &ComponentValues,
                              const DenseMap<Value *, Value *> &NewValues,
                              ExtKind InternalKind, unsigned OrigWidth,
                              unsigned TargetWidth) {
   if (!canRetargetBoundaryCompare(Cmp.getPredicate(), InternalKind))
-    return false;
+    return tryRetargetExternalUnsignedCompareViaSelect(Cmp, ComponentValues,
+                                                       OrigWidth, InternalKind);
 
   // Retarget the compare itself when the widened internal representation
   // already matches the predicate's semantics. This is cheaper than truncating

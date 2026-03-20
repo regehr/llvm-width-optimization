@@ -57,7 +57,9 @@ Implemented today:
 - target-width-extension-aware sign selection inside widened components so the
   internal representation matches the dominant removable `zext`/`sext`
   boundary kind
-- per-edge boundary repair for widened components
+- per-edge boundary repair for widened components, including select-arm
+  splitting for unsigned compares that cannot directly use a sign-extended
+  internal value
 - planner-side compare affinities so `icmp` operands can pull component widths
   toward agreement
 - weighted planner pressure for repeated def-use boundaries and repeated

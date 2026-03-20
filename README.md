@@ -80,7 +80,9 @@ currently comes from targeted local rewrites that complement the planner.
 - target-width-extension-aware sign selection for widened components so the
   internal representation matches the dominant removable boundary casts
 - per-edge boundary repair for widened components, including retargeting
-  external `icmp` users when the widened representation is compatible
+  external `icmp` users when the widened representation is compatible, plus
+  select-arm splitting for unsigned compares that cannot use a sign-extended
+  internal value directly
 
 The current planner keeps `i1` components fixed. Boolean values are tracked
 for analysis and printing, but they are outside the current global width
@@ -235,12 +237,13 @@ proof and regression discipline.
 
 - use `scripts/compare_width_precision.py` as a standing precision oracle and
   close the current LLVM-win gaps below
-- improve compare-focused local rewrites and boundary retargeting so the pass
-  keeps up with LLVM on the remaining scalar compare cases
-  Current oracle losses: `test/width-opt-component-widen-icmp-ult-no-retarget.ll`.
 - relax shared-extension merge handling so the pass keeps up with LLVM on the
   remaining conditional-dataflow case
   Current oracle losses: `test/width-opt-select-shared-ext-user-repair.ll`.
+- improve mixed-kind widened-component cleanup so the pass keeps up with LLVM
+  on the remaining scalar mixed-extension case
+  Current oracle losses:
+  `test/width-opt-component-widen-mixed-ext-kinds-prefer-sext.ll`.
 - strengthen trunc-rooted arithmetic handling where shared wide operands still
   block profitable narrowing
   Current oracle losses: `test/width-opt-trunc-add-wide-operands-no-increase.ll`.
