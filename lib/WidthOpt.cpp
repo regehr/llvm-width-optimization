@@ -469,6 +469,8 @@ bool tryWidenTruncZeroExtendedICmp(ICmpInst &Cmp, const DataLayout &DL,
                                    AssumptionCache *AC, DominatorTree *DT) {
   if (!isEqOrNe(Cmp.getPredicate()) && !isUnsignedICmp(Cmp.getPredicate()))
     return false;
+  if (!isIntegerValue(Cmp.getOperand(0)) || !isIntegerValue(Cmp.getOperand(1)))
+    return false;
 
   // This is intentionally asymmetric. We allow one operand to stay wide when
   // its truncated-away high bits are known zero, then zero-extend the other
