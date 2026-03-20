@@ -88,9 +88,6 @@ bool hasFixedIntegerSignature(const CallBase &CB) {
   if (CB.getCalledFunction() == nullptr)
     return true;
 
-  if (CB.isInlineAsm())
-    return true;
-
   const Function *Callee = CB.getCalledFunction();
   if (Callee->isIntrinsic()) {
     Intrinsic::ID ID = Callee->getIntrinsicID();
@@ -438,8 +435,8 @@ bool tryWidenTruncZeroExtendedICmp(ICmpInst &Cmp, const DataLayout &DL,
     Value *Wide = Tr->getOperand(0);
     unsigned NarrowWidth = getValueWidth(Tr);
     unsigned WideWidth = getValueWidth(Wide);
-    if (NarrowWidth >= WideWidth)
-      return false;
+    assert(NarrowWidth < WideWidth &&
+           "Trunc operands must be narrower than their source");
 
     Value *Other = Cmp.getOperand(1 - TruncIdx);
     if (!isIntegerValue(Other) || getValueWidth(Other) != NarrowWidth)
@@ -842,8 +839,8 @@ unsigned getUnsignedRangeWidth(const Use &OperandUse, LazyValueInfo &LVI) {
 }
 
 bool tryNarrowUDivWithRange(BinaryOperator &BO, LazyValueInfo &LVI) {
-  if (BO.getOpcode() != Instruction::UDiv)
-    return false;
+  assert(BO.getOpcode() == Instruction::UDiv &&
+         "UDiv narrowing expects a udiv instruction");
 
   unsigned OrigWidth = getValueWidth(&BO);
   unsigned LHSWidth = getUnsignedRangeWidth(BO.getOperandUse(0), LVI);
@@ -898,7 +895,9 @@ bool canWidenAddOperandWithoutOverflow(const ExtOperandInfo &ExtInfo,
 }
 
 bool tryWidenAddThroughZExt(BinaryOperator &BO) {
-  if (BO.getOpcode() != Instruction::Add || !BO.hasOneUse())
+  assert(BO.getOpcode() == Instruction::Add &&
+         "Add widening expects an add instruction");
+  if (!BO.hasOneUse())
     return false;
 
   auto *WideZ = dyn_cast<ZExtInst>(*BO.user_begin());
@@ -907,8 +906,9 @@ bool tryWidenAddThroughZExt(BinaryOperator &BO) {
 
   unsigned WideWidth = getValueWidth(WideZ);
   unsigned MidWidth = getValueWidth(&BO);
-  if (WideWidth <= MidWidth)
-    return false;
+  (void)MidWidth;
+  assert(WideWidth > MidWidth &&
+         "ZExt users should be wider than their operands");
   if (BO.hasNoUnsignedWrap() || BO.hasNoSignedWrap())
     return false;
 
@@ -957,8 +957,8 @@ bool tryFoldZExtOfTruncToMask(ZExtInst &Ext) {
   unsigned SrcWidth = getValueWidth(Src);
   unsigned NarrowWidth = getValueWidth(Tr);
   unsigned WideWidth = getValueWidth(&Ext);
-  if (NarrowWidth >= WideWidth)
-    return false;
+  assert(NarrowWidth < WideWidth &&
+         "ZExt results must be wider than their truncated operand");
 
   IRBuilder<> B(&Ext);
 
@@ -998,25 +998,26 @@ bool tryShrinkTruncOfAdd(TruncInst &Tr) {
 
   unsigned TargetWidth = getValueWidth(&Tr);
   unsigned SourceWidth = getValueWidth(BO);
-  if (TargetWidth >= SourceWidth)
-    return false;
+  (void)SourceWidth;
+  assert(TargetWidth < SourceWidth &&
+         "Trunc results must be narrower than their source");
 
   IRBuilder<> B(&Tr);
   auto *TargetTy = IntegerType::get(Tr.getContext(), TargetWidth);
   auto materializeOperand = [&](Value *V) -> Value * {
-    if (!isIntegerValue(V))
-      return nullptr;
+    assert(isIntegerValue(V) && "Trunc-rooted add operands should be integers");
     unsigned W = getValueWidth(V);
-    if (W == TargetWidth)
-      return V;
+    (void)W;
+    assert(W != TargetWidth &&
+           "Add operands stay at the source width until rebuilt");
     if (auto Ext = getExtOperandInfo(V))
       if (Ext->NarrowWidth == TargetWidth)
         return Ext->NarrowValue;
     if (auto *C = dyn_cast<ConstantInt>(V))
       return ConstantInt::get(TargetTy, C->getValue().trunc(TargetWidth));
-    if (W > TargetWidth)
-      return B.CreateTrunc(V, TargetTy);
-    return B.CreateZExt(V, TargetTy);
+    assert(W > TargetWidth &&
+           "Remaining add operands should still be wider than the target");
+    return B.CreateTrunc(V, TargetTy);
   };
 
   Value *LHS = materializeOperand(BO->getOperand(0));

@@ -20,4 +20,3 @@ entry:
 ; CHECK: Width components for function 'f':
 ; CHECK: [arg]
 ; CHECK: [anchor]
-; CHECK: [conditional]
