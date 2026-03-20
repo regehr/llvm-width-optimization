@@ -30,6 +30,7 @@ using namespace llvm;
 namespace widthopt {
 
 AnalysisKey WidthComponentAnalysis::Key;
+AnalysisKey WidthPlanAnalysis::Key;
 
 namespace {
 
@@ -717,10 +718,128 @@ static void inferCandidatesFromInstruction(Instruction &I,
   }
 }
 
-} // namespace
+static Constant *extendConstant(ConstantInt &C, ExtKind Kind,
+                                unsigned TargetWidth) {
+  APInt V = C.getValue();
+  APInt NewV =
+      Kind == ExtKind::ZExt ? V.zext(TargetWidth) : V.sext(TargetWidth);
+  return ConstantInt::get(IntegerType::get(C.getContext(), TargetWidth), NewV);
+}
 
-WidthComponentAnalysis::Result
-WidthComponentAnalysis::run(Function &F, FunctionAnalysisManager &) {
+static Value *materializeValueAtWidth(Value *V, ExtKind Kind,
+                                      unsigned TargetWidth,
+                                      Instruction *InsertBefore) {
+  if (getValueWidth(V) == TargetWidth)
+    return V;
+
+  auto *TargetTy = IntegerType::get(V->getContext(), TargetWidth);
+  if (auto *C = dyn_cast<ConstantInt>(V))
+    return extendConstant(*C, Kind, TargetWidth);
+  if (isa<UndefValue>(V))
+    return UndefValue::get(TargetTy);
+  if (isa<PoisonValue>(V))
+    return PoisonValue::get(TargetTy);
+
+  IRBuilder<> B(InsertBefore);
+  switch (Kind) {
+  case ExtKind::ZExt:
+    return B.CreateZExt(V, TargetTy);
+  case ExtKind::SExt:
+    return B.CreateSExt(V, TargetTy);
+  case ExtKind::None:
+    break;
+  }
+  llvm_unreachable("Unexpected extension kind");
+}
+
+static unsigned edgeCutCost(unsigned FromWidth, unsigned ToWidth) {
+  return FromWidth == ToWidth ? 0u : 1u;
+}
+
+static unsigned scoreWidthChoice(const AnalysisResult &R,
+                                 ArrayRef<unsigned> ChosenWidths,
+                                 unsigned ComponentID, unsigned Width) {
+  unsigned Score = 0;
+  for (const ComponentEdge &E : R.Edges) {
+    if (E.From == ComponentID)
+      Score += edgeCutCost(Width, ChosenWidths[E.To]);
+    else if (E.To == ComponentID)
+      Score += edgeCutCost(ChosenWidths[E.From], Width);
+  }
+  return Score;
+}
+
+static bool preferOrigWidthOnTie(const Component &C) {
+  return C.Instructions.size() == 1 &&
+         (isa<ZExtInst>(C.Instructions.front()) ||
+          isa<SExtInst>(C.Instructions.front()) ||
+          isa<TruncInst>(C.Instructions.front()));
+}
+
+static bool isBetterWidthChoice(const Component &C, unsigned CandidateWidth,
+                                unsigned CandidateScore, unsigned BestWidth,
+                                unsigned BestScore) {
+  if (CandidateScore != BestScore)
+    return CandidateScore < BestScore;
+  if (preferOrigWidthOnTie(C)) {
+    bool CandidateIsOrig = CandidateWidth == C.OrigWidth;
+    bool BestIsOrig = BestWidth == C.OrigWidth;
+    if (CandidateIsOrig != BestIsOrig)
+      return CandidateIsOrig;
+  }
+  if (CandidateWidth != BestWidth)
+    return CandidateWidth < BestWidth;
+  return false;
+}
+
+static PlanResult computeWidthPlan(const AnalysisResult &R) {
+  PlanResult Plan;
+  Plan.ChosenWidths.reserve(R.Components.size());
+  for (const Component &C : R.Components)
+    Plan.ChosenWidths.push_back(C.OrigWidth);
+
+  unsigned MaxRounds = std::max<unsigned>(1, R.Components.size() * 4);
+  for (unsigned Round = 0; Round != MaxRounds; ++Round) {
+    bool Changed = false;
+
+    for (const Component &C : R.Components) {
+      if (C.Fixed)
+        continue;
+
+      SmallVector<unsigned, 4> Widths = C.CandidateWidths;
+      if (!llvm::is_contained(Widths, C.OrigWidth))
+        Widths.push_back(C.OrigWidth);
+      llvm::sort(Widths);
+
+      unsigned BestWidth = Plan.ChosenWidths[C.ID];
+      unsigned BestScore =
+          scoreWidthChoice(R, Plan.ChosenWidths, C.ID, BestWidth);
+      for (unsigned Width : Widths) {
+        unsigned Score = scoreWidthChoice(R, Plan.ChosenWidths, C.ID, Width);
+        if (isBetterWidthChoice(C, Width, Score, BestWidth, BestScore)) {
+          BestWidth = Width;
+          BestScore = Score;
+        }
+      }
+
+      if (BestWidth != Plan.ChosenWidths[C.ID]) {
+        Plan.ChosenWidths[C.ID] = BestWidth;
+        Changed = true;
+      }
+    }
+
+    if (!Changed)
+      break;
+  }
+
+  for (const ComponentEdge &E : R.Edges)
+    Plan.TotalCutCost +=
+        edgeCutCost(Plan.ChosenWidths[E.From], Plan.ChosenWidths[E.To]);
+
+  return Plan;
+}
+
+static AnalysisResult computeWidthComponents(Function &F) {
   EquivalenceClasses<const Value *> EC;
   DenseSet<const Value *> TrackedValues;
   for (Argument &Arg : F.args()) {
@@ -792,6 +911,94 @@ WidthComponentAnalysis::run(Function &F, FunctionAnalysisManager &) {
   return R;
 }
 
+static bool tryWidenPhiFromPlan(PHINode &Phi, const AnalysisResult &R,
+                                const PlanResult &Plan) {
+  auto CompIt = R.ValueToComponent.find(&Phi);
+  if (CompIt == R.ValueToComponent.end())
+    return false;
+
+  const Component &C = R.Components[CompIt->second];
+  if (C.Fixed || C.Instructions.size() != 1 || C.Instructions.front() != &Phi)
+    return false;
+
+  unsigned OrigWidth = getValueWidth(&Phi);
+  unsigned TargetWidth = Plan.ChosenWidths[C.ID];
+  if (TargetWidth <= OrigWidth)
+    return false;
+
+  ExtKind Kind = ExtKind::None;
+  SmallVector<Instruction *, 8> ExtUsers;
+  for (User *U : Phi.users()) {
+    auto *I = dyn_cast<Instruction>(U);
+    if (!I)
+      return false;
+
+    ExtKind UserKind = ExtKind::None;
+    if (auto *Z = dyn_cast<ZExtInst>(I)) {
+      if (Z->getOperand(0) != &Phi || getValueWidth(Z) != TargetWidth)
+        return false;
+      UserKind = ExtKind::ZExt;
+    } else if (auto *S = dyn_cast<SExtInst>(I)) {
+      if (S->getOperand(0) != &Phi || getValueWidth(S) != TargetWidth)
+        return false;
+      UserKind = ExtKind::SExt;
+    } else {
+      return false;
+    }
+
+    if (Kind == ExtKind::None)
+      Kind = UserKind;
+    else if (Kind != UserKind)
+      return false;
+
+    ExtUsers.push_back(I);
+  }
+
+  if (Kind == ExtKind::None || ExtUsers.empty())
+    return false;
+
+  auto *TargetTy = IntegerType::get(Phi.getContext(), TargetWidth);
+  auto *NewPhi =
+      PHINode::Create(TargetTy, Phi.getNumIncomingValues(), "", Phi.getIterator());
+  NewPhi->setDebugLoc(Phi.getDebugLoc());
+
+  for (unsigned I = 0, E = Phi.getNumIncomingValues(); I != E; ++I) {
+    Value *Incoming = Phi.getIncomingValue(I);
+    BasicBlock *Pred = Phi.getIncomingBlock(I);
+    Instruction *InsertBefore = Pred->getTerminator();
+    Value *WideIncoming =
+        materializeValueAtWidth(Incoming, Kind, TargetWidth, InsertBefore);
+    NewPhi->addIncoming(WideIncoming, Pred);
+  }
+
+  NewPhi->takeName(&Phi);
+  for (Instruction *Ext : ExtUsers) {
+    Ext->replaceAllUsesWith(NewPhi);
+    Ext->eraseFromParent();
+  }
+
+  if (Phi.use_empty()) {
+    Phi.eraseFromParent();
+    return true;
+  }
+
+  NewPhi->eraseFromParent();
+  return false;
+}
+
+} // namespace
+
+WidthComponentAnalysis::Result
+WidthComponentAnalysis::run(Function &F, FunctionAnalysisManager &) {
+  return computeWidthComponents(F);
+}
+
+WidthPlanAnalysis::Result WidthPlanAnalysis::run(Function &F,
+                                                 FunctionAnalysisManager &AM) {
+  const AnalysisResult &R = AM.getResult<WidthComponentAnalysis>(F);
+  return computeWidthPlan(R);
+}
+
 PreservedAnalyses WidthComponentPrinter::run(Function &F,
                                              FunctionAnalysisManager &AM) {
   const AnalysisResult &R = AM.getResult<WidthComponentAnalysis>(F);
@@ -853,8 +1060,35 @@ PreservedAnalyses WidthCandidatePrinter::run(Function &F,
   return PreservedAnalyses::all();
 }
 
+PreservedAnalyses WidthPlanPrinter::run(Function &F,
+                                        FunctionAnalysisManager &AM) {
+  const AnalysisResult &R = AM.getResult<WidthComponentAnalysis>(F);
+  const PlanResult &Plan = AM.getResult<WidthPlanAnalysis>(F);
+
+  OS << "Width plan for function '" << F.getName()
+     << "': total-cut-cost=" << Plan.TotalCutCost << "\n";
+  for (const Component &C : R.Components) {
+    SmallVector<unsigned, 4> Widths = C.CandidateWidths;
+    if (!llvm::is_contained(Widths, C.OrigWidth))
+      Widths.push_back(C.OrigWidth);
+    llvm::sort(Widths);
+
+    OS << formatv("  component {0}: orig=i{1}, fixed={2}, chosen=i{3}, "
+                  "candidates=",
+                  C.ID, C.OrigWidth, C.Fixed ? "true" : "false",
+                  Plan.ChosenWidths[C.ID]);
+    for (unsigned I = 0, E = Widths.size(); I != E; ++I) {
+      if (I)
+        OS << ",";
+      OS << "i" << Widths[I];
+    }
+    OS << "\n";
+  }
+
+  return PreservedAnalyses::all();
+}
+
 PreservedAnalyses WidthOptPass::run(Function &F, FunctionAnalysisManager &AM) {
-  (void)AM.getResult<WidthComponentAnalysis>(F);
   LazyValueInfo &LVI = AM.getResult<LazyValueAnalysis>(F);
   AssumptionCache &AC = AM.getResult<AssumptionAnalysis>(F);
   DominatorTree &DT = AM.getResult<DominatorTreeAnalysis>(F);
@@ -908,6 +1142,20 @@ PreservedAnalyses WidthOptPass::run(Function &F, FunctionAnalysisManager &AM) {
     Changed |= tryShrinkPhiOfExts(*Phi);
   }
 
+  AnalysisResult R = computeWidthComponents(F);
+  PlanResult Plan = computeWidthPlan(R);
+
+  SmallVector<PHINode *, 16> PhiWidenWorklist;
+  for (Instruction &I : instructions(F))
+    if (auto *Phi = dyn_cast<PHINode>(&I))
+      PhiWidenWorklist.push_back(Phi);
+
+  for (PHINode *Phi : PhiWidenWorklist) {
+    if (Phi->getParent() == nullptr)
+      continue;
+    Changed |= tryWidenPhiFromPlan(*Phi, R, Plan);
+  }
+
   if (!Changed)
     return PreservedAnalyses::all();
   return PreservedAnalyses::none();
@@ -919,6 +1167,7 @@ static PassPluginLibraryInfo getWidthOptPluginInfo() {
             PB.registerAnalysisRegistrationCallback(
                 [](FunctionAnalysisManager &FAM) {
                   FAM.registerPass([&] { return WidthComponentAnalysis(); });
+                  FAM.registerPass([&] { return WidthPlanAnalysis(); });
                 });
 
             PB.registerPipelineParsingCallback(
@@ -934,6 +1183,10 @@ static PassPluginLibraryInfo getWidthOptPluginInfo() {
                   }
                   if (Name == "print<width-candidates>") {
                     FPM.addPass(WidthCandidatePrinter(errs()));
+                    return true;
+                  }
+                  if (Name == "print<width-plan>") {
+                    FPM.addPass(WidthPlanPrinter(errs()));
                     return true;
                   }
                   return false;

@@ -42,10 +42,24 @@ struct AnalysisResult {
   llvm::SmallVector<ComponentEdge, 16> Edges;
 };
 
+struct PlanResult {
+  llvm::SmallVector<unsigned, 8> ChosenWidths;
+  unsigned TotalCutCost = 0;
+};
+
 class WidthComponentAnalysis
     : public llvm::AnalysisInfoMixin<WidthComponentAnalysis> {
 public:
   using Result = AnalysisResult;
+
+  Result run(llvm::Function &F, llvm::FunctionAnalysisManager &AM);
+
+  static llvm::AnalysisKey Key;
+};
+
+class WidthPlanAnalysis : public llvm::AnalysisInfoMixin<WidthPlanAnalysis> {
+public:
+  using Result = PlanResult;
 
   Result run(llvm::Function &F, llvm::FunctionAnalysisManager &AM);
 
@@ -66,6 +80,15 @@ class WidthCandidatePrinter : public llvm::PassInfoMixin<WidthCandidatePrinter> 
 
 public:
   explicit WidthCandidatePrinter(llvm::raw_ostream &OS) : OS(OS) {}
+  llvm::PreservedAnalyses run(llvm::Function &F,
+                              llvm::FunctionAnalysisManager &AM);
+};
+
+class WidthPlanPrinter : public llvm::PassInfoMixin<WidthPlanPrinter> {
+  llvm::raw_ostream &OS;
+
+public:
+  explicit WidthPlanPrinter(llvm::raw_ostream &OS) : OS(OS) {}
   llvm::PreservedAnalyses run(llvm::Function &F,
                               llvm::FunctionAnalysisManager &AM);
 };
