@@ -202,6 +202,68 @@ The obvious next steps are no longer about filling out the original test
 corpus. They are about broadening the optimizer while keeping the existing
 proof and regression discipline.
 
+- fix current implementation weaknesses that leave supported reductions on the
+  table
+
+### Concrete TODOs from a `lib/WidthOpt.cpp` review
+
+- fix the planner cost model so it counts all boundary pressure instead of
+  collapsing each component pair to a single unit-cost edge or compare
+  affinity
+  The current planner deduplicates ordinary def-use edges and compare
+  affinities down to one entry per component pair, then charges each mismatch
+  as cost 1. If one component feeds several width-changing users in the same
+  neighboring component, or several compares tie the same pair together, the
+  plan still sees only one unit of pressure. This systematically understates
+  the benefit of agreeing widths across heavily used boundaries.
+- align planner-side movable components with what the executor can actually
+  rebuild
+  Today the analysis and planner can choose widths for components containing
+  `icmp`, `zext`, `sext`, and `trunc`, but the plan consumer only realizes
+  widenings for small width-polymorphic regions built from `phi`, `select`,
+  `freeze`, `and`, `or`, and `xor`. That mismatch lets neighboring components
+  optimize against width choices that never materialize, which directly weakens
+  the final result.
+- make the pass iterate to a fixed point instead of running each rewrite family
+  once over a snapshot worklist
+  Several currently supported transforms can expose other currently supported
+  transforms later in the pass. In particular, compare shrinking runs before
+  `phi` and `select` shrinking, so a newly narrowed `phi` or `select` can
+  create an ext/ext compare shape that is never revisited. Re-running the
+  local rewrites until they stabilize should recover these missed reductions.
+- remove input-order sensitivity from `phi` shrinking
+  The current `phi` shrinker gives up if it sees a constant incoming before it
+  has seen the first extension incoming, even when the PHI is otherwise fully
+  shrinkable. Since PHI incoming order is arbitrary, the same reducible PHI can
+  optimize or fail purely based on edge ordering.
+- relax `phi` and `select` shrinking so they can use a common intermediate
+  width instead of requiring all extension arms to have the exact same narrow
+  width
+  The implementation already has a helper that can materialize an extension
+  operand at any width between its narrow and wide forms, but the `phi` and
+  `select` matchers still require all extension arms to agree on one exact
+  narrow width. That leaves legal cases such as mixed `zext i8` and `zext i16`
+  arms feeding one wider `phi` or `select` untouched even though shrinking to
+  `i16` is already structurally supported.
+- improve the widened-component internal sign policy so one target-width
+  `zext` user does not block elimination of many target-width `sext` users, or
+  vice versa
+  The current widener chooses a sign-extended internal representation only when
+  there are target-width `sext` consumers and zero target-width `zext`
+  consumers; otherwise it defaults to zero-extension. Because existing target-
+  width extensions are removed only when that exact internal choice matches
+  them, this coarse policy can leave a large number of removable extensions in
+  place.
+- audit and either prove or remove the mixed `sext`/`zext` `icmp eq/ne`
+  shrinking rule
+  The current implementation and tests claim that equality across mixed sign
+  and zero extensions can always be narrowed to the max of the source widths.
+  That deserves a dedicated re-check because it appears suspicious when the two
+  source widths are equal: for example, `sext i8 0x80` and `zext i8 0x80` are
+  not equal at the wide width, but the narrowed `icmp eq i8` would report them
+  equal. This is a correctness TODO rather than an effectiveness TODO, but it
+  is important enough to keep visible in the near-term work list.
+
 - generalize the global planner beyond the current simple heuristic and binary
   candidate model
 - broaden plan-driven rewrites to more instruction kinds than the current small
