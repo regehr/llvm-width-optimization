@@ -22,6 +22,20 @@ def run(cmd: List[str]) -> subprocess.CompletedProcess[str]:
     )
 
 
+def is_crash(proc: subprocess.CompletedProcess[str]) -> bool:
+    if proc.returncode < 0:
+        return True
+
+    combined_output = "\n".join(part for part in [proc.stdout, proc.stderr] if part).lower()
+    crash_markers = [
+        "stack dump",
+        "please submit a bug report",
+        "segmentation fault",
+        "signal",
+    ]
+    return any(marker in combined_output for marker in crash_markers)
+
+
 def candidate_plugins(repo_root: Path) -> Iterable[Path]:
     env_plugin = os.environ.get("WIDTH_OPT_PLUGIN")
     if env_plugin:
@@ -51,6 +65,8 @@ def count_instructions(opt_bin: Path, ir_file: Path) -> int:
             str(ir_file),
         ]
     )
+    if is_crash(proc):
+        raise SystemExit(format_failure("count crash", ir_file, proc))
     if proc.returncode != 0:
         raise RuntimeError(format_failure("count", ir_file, proc))
 
@@ -80,6 +96,8 @@ def optimize_file(opt_bin: Path, plugin: Path, src: Path, dst: Path) -> None:
             str(dst),
         ]
     )
+    if is_crash(proc):
+        raise SystemExit(format_failure("opt crash", src, proc))
     if proc.returncode != 0:
         raise RuntimeError(format_failure("opt", src, proc))
 

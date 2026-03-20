@@ -266,11 +266,15 @@ void addCandidateWidth(Component &C, unsigned W) {
 
 std::optional<ExtOperandInfo> getExtOperandInfo(Value *V) {
   if (auto *Z = dyn_cast<ZExtInst>(V)) {
+    if (!isIntegerValue(Z->getOperand(0)) || !isIntegerValue(Z))
+      return std::nullopt;
     return ExtOperandInfo{Z->getOperand(0), Z, ExtKind::ZExt,
                           getValueWidth(Z->getOperand(0)), getValueWidth(Z)};
   }
 
   if (auto *S = dyn_cast<SExtInst>(V)) {
+    if (!isIntegerValue(S->getOperand(0)) || !isIntegerValue(S))
+      return std::nullopt;
     return ExtOperandInfo{S->getOperand(0), S, ExtKind::SExt,
                           getValueWidth(S->getOperand(0)), getValueWidth(S)};
   }
@@ -1414,6 +1418,8 @@ void inferCandidatesFromInstruction(Instruction &I, AnalysisResult &R) {
   // proof; it is only a way to seed the planner with widths that are already
   // suggested by ext/trunc structure in the current IR.
   if (auto *Ext = dyn_cast<ZExtInst>(&I)) {
+    if (!isIntegerValue(Ext->getOperand(0)) || !isIntegerValue(Ext))
+      return;
     unsigned SrcW = getValueWidth(Ext->getOperand(0));
     unsigned DstW = getValueWidth(Ext);
     if (SrcW == 1 || DstW == 1)
@@ -1426,6 +1432,8 @@ void inferCandidatesFromInstruction(Instruction &I, AnalysisResult &R) {
   }
 
   if (auto *Ext = dyn_cast<SExtInst>(&I)) {
+    if (!isIntegerValue(Ext->getOperand(0)) || !isIntegerValue(Ext))
+      return;
     unsigned SrcW = getValueWidth(Ext->getOperand(0));
     unsigned DstW = getValueWidth(Ext);
     if (SrcW == 1 || DstW == 1)
@@ -1438,6 +1446,8 @@ void inferCandidatesFromInstruction(Instruction &I, AnalysisResult &R) {
   }
 
   if (auto *Tr = dyn_cast<TruncInst>(&I)) {
+    if (!isIntegerValue(Tr->getOperand(0)) || !isIntegerValue(Tr))
+      return;
     unsigned SrcW = getValueWidth(Tr->getOperand(0));
     unsigned DstW = getValueWidth(Tr);
     if (SrcW == 1 || DstW == 1)
@@ -1450,6 +1460,8 @@ void inferCandidatesFromInstruction(Instruction &I, AnalysisResult &R) {
   }
 
   if (auto *Phi = dyn_cast<PHINode>(&I)) {
+    if (!isIntegerValue(Phi))
+      return;
     unsigned ThisID = R.ValueToComponent.lookup(Phi);
     for (Value *Incoming : Phi->incoming_values()) {
       auto Ext = getExtOperandInfo(Incoming);
