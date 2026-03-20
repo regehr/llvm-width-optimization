@@ -275,55 +275,23 @@ proof and regression discipline.
 
 - use `scripts/compare_width_precision.py` as a standing precision oracle and
   close the current LLVM-win gaps below
-- recover the simple local `sext`/`zext` eliminations that LLVM still finds
-  while `width-opt` leaves both casts in place
-  Current oracle losses: `test/no-branch-almost-nonnegative-sext-to-zext.ll`,
-  `test/yes-branch-nonnegative-sext-to-zext.ll`,
-  `test/width-candidates-basic.ll`, and `test/width-components-basic.ll`.
-- improve compare-focused local rewrites so they match LLVM on the current
-  signed, unsigned, equality, freeze, and trunc-rooted cases
-  Current oracle losses: `test/yes-freeze-icmp-ult-zext-zext.ll`,
-  `test/yes-icmp-assume-trunc-trunc-eq.ll`,
-  `test/yes-icmp-assume-trunc-zext.ll`,
-  `test/yes-icmp-eq-zext-zext.ll`,
-  `test/yes-icmp-slt-sext-sext.ll`,
-  `test/yes-icmp-ult-zext-zext.ll`,
-  `test/width-opt-icmp-sext-sext-eq.ll`,
-  `test/width-opt-icmp-after-phi-shrink.ll`,
-  `test/width-opt-icmp-after-select-shrink.ll`,
-  `test/width-opt-icmp-ult-shared-trunc-no-increase.ll`,
-  `test/width-opt-trunc-icmp-ult-sext-other.ll`,
-  `test/width-opt-component-widen-icmp-eq.ll`,
-  `test/width-opt-component-widen-icmp-slt.ll`, and
-  `test/width-opt-component-widen-icmp-ult-no-retarget.ll`.
-- relax `phi` and `select` handling so the pass keeps up with LLVM on the
-  current cast-removal opportunities around merges and conditional dataflow
-  Current oracle losses: `test/yes-phi-zexts-constant.ll`,
-  `test/yes-select-sext-trunc.ll`,
-  `test/width-opt-phi-zext-constant-leading.ll`,
-  `test/width-opt-phi-widen-sext-users.ll`,
-  `test/width-opt-phi-widen-zext-users.ll`,
-  `test/width-opt-select-zext-zext.ll`,
-  `test/width-opt-select-shared-ext-no-increase.ll`,
-  `test/width-opt-select-widen-sext-users.ll`, and
-  `test/width-opt-select-widen-zext-users.ll`.
-- strengthen trunc-rooted arithmetic, division, and `zext(trunc(x))` masking
-  rewrites so they are not behind LLVM on the current scalar cases
-  Current oracle losses: `test/yes-trunc-add-zext-operand.ll`,
-  `test/yes-zext-trunc-to-mask.ll`,
-  `test/width-opt-trunc-add-constant.ll`,
-  `test/width-opt-trunc-add-wide-operands-no-increase.ll`,
-  `test/width-opt-udiv-zext-operands.ll`,
-  `test/width-opt-udiv-zext-trunc-user.ll`, and
-  `test/width-opt-zext-trunc-to-mask-small-source.ll`.
-- improve plan-driven widening and boundary repair so LLVM no longer wins on
-  the current component-widening and planner-regression cases
-  Current oracle losses: `test/width-opt-component-widen-bitwise.ll`,
-  `test/width-opt-component-widen-mixed-boundary.ll`,
-  `test/width-opt-component-widen-poison.ll`,
-  `test/width-opt-component-widen-undef.ll`,
-  `test/width-opt-component-widen-zext-users.ll`,
-  `test/width-plan-basic.ll`, and `test/width-plan-widening.ll`.
+- improve compare-focused local rewrites and boundary retargeting so the pass
+  keeps up with LLVM on the remaining scalar compare cases
+  Current oracle losses: `test/width-opt-component-widen-icmp-ult-no-retarget.ll`
+  and `test/width-opt-icmp-ult-shared-trunc-no-increase.ll`.
+- relax shared-extension merge handling so the pass keeps up with LLVM on the
+  remaining conditional-dataflow case
+  Current oracle losses: `test/width-opt-select-shared-ext-no-increase.ll`.
+- strengthen trunc-rooted arithmetic handling where shared wide operands still
+  block profitable narrowing
+  Current oracle losses: `test/width-opt-trunc-add-wide-operands-no-increase.ll`.
+- make the compare, trunc-rooted, and `zext(trunc(x))` rewrites work for the
+  remaining vector cases where LLVM still removes casts and `width-opt` does
+  not
+  Current oracle losses: `test/width-opt-icmp-eq-vector-no-crash.ll`,
+  `test/width-opt-trunc-add-vector-no-crash.ll`,
+  `test/width-opt-trunc-icmp-vector-no-crash.ll`, and
+  `test/width-opt-zext-trunc-vector-no-crash.ll`.
 - generalize trunc-rooted arithmetic shrinking beyond the current targeted
   helpers
 - add more direct profitability modeling so local widen/narrow decisions align

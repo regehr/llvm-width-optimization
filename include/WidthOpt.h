@@ -34,11 +34,13 @@ struct Component {
 struct ComponentEdge {
   unsigned From = 0;
   unsigned To = 0;
+  unsigned Weight = 0;
 };
 
 struct CompareAffinity {
   unsigned LHS = 0;
   unsigned RHS = 0;
+  unsigned Weight = 0;
 };
 
 struct AnalysisResult {

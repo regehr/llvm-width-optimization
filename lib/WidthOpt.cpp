@@ -1687,9 +1687,9 @@ unsigned scoreWidthChoice(const AnalysisResult &R,
   unsigned Score = 0;
   for (const ComponentEdge &E : R.Edges) {
     if (E.From == ComponentID)
-      Score += edgeCutCost(Width, ChosenWidths[E.To]);
+      Score += E.Weight * edgeCutCost(Width, ChosenWidths[E.To]);
     else if (E.To == ComponentID)
-      Score += edgeCutCost(ChosenWidths[E.From], Width);
+      Score += E.Weight * edgeCutCost(ChosenWidths[E.From], Width);
   }
   // Compares do not define a common-width component because their result is
   // i1, but they still create pressure for their integer operands to agree on
@@ -1698,9 +1698,9 @@ unsigned scoreWidthChoice(const AnalysisResult &R,
     assert(A.LHS < ChosenWidths.size() && A.RHS < ChosenWidths.size() &&
            "Compare affinities should reference valid component IDs");
     if (A.LHS == ComponentID)
-      Score += compareAffinityCost(Width, ChosenWidths[A.RHS]);
+      Score += A.Weight * compareAffinityCost(Width, ChosenWidths[A.RHS]);
     else if (A.RHS == ComponentID)
-      Score += compareAffinityCost(ChosenWidths[A.LHS], Width);
+      Score += A.Weight * compareAffinityCost(ChosenWidths[A.LHS], Width);
   }
   return Score;
 }
@@ -1782,11 +1782,12 @@ PlanResult computeWidthPlan(const AnalysisResult &R) {
   // chooser used so debug output stays interpretable.
   for (const ComponentEdge &E : R.Edges)
     Plan.TotalCutCost +=
-        edgeCutCost(Plan.ChosenWidths[E.From], Plan.ChosenWidths[E.To]);
+        E.Weight * edgeCutCost(Plan.ChosenWidths[E.From], Plan.ChosenWidths[E.To]);
   for (const CompareAffinity &A : R.CompareAffinities) {
     assert(A.LHS < Plan.ChosenWidths.size() && A.RHS < Plan.ChosenWidths.size() &&
            "Compare affinities should reference valid component IDs");
     Plan.TotalCutCost +=
+        A.Weight *
         compareAffinityCost(Plan.ChosenWidths[A.LHS], Plan.ChosenWidths[A.RHS]);
   }
 
@@ -1852,8 +1853,8 @@ AnalysisResult computeWidthComponents(Function &F) {
     }
   }
 
-  DenseSet<uint64_t> SeenEdges;
-  DenseSet<uint64_t> SeenCompareAffinities;
+  DenseMap<uint64_t, unsigned> EdgeKeyToIndex;
+  DenseMap<uint64_t, unsigned> AffinityKeyToIndex;
   for (Instruction &I : instructions(F)) {
     // Ordinary cross-component def-use edges become cut candidates in the
     // planner: differing chosen widths here imply a boundary conversion.
@@ -1867,8 +1868,10 @@ AnalysisResult computeWidthComponents(Function &F) {
       if (FromIt->second == ToIt->second)
         continue;
       uint64_t Key = (uint64_t(FromIt->second) << 32) | uint64_t(ToIt->second);
-      if (SeenEdges.insert(Key).second)
-        R.Edges.push_back(ComponentEdge{FromIt->second, ToIt->second});
+      auto [EdgeIt, Inserted] = EdgeKeyToIndex.try_emplace(Key, R.Edges.size());
+      if (Inserted)
+        R.Edges.push_back(ComponentEdge{FromIt->second, ToIt->second, 0});
+      ++R.Edges[EdgeIt->second].Weight;
     }
 
     if (auto *Cmp = dyn_cast<ICmpInst>(&I)) {
@@ -1886,8 +1889,11 @@ AnalysisResult computeWidthComponents(Function &F) {
           unsigned A = std::min(LHSIt->second, RHSIt->second);
           unsigned B = std::max(LHSIt->second, RHSIt->second);
           uint64_t Key = (uint64_t(A) << 32) | uint64_t(B);
-          if (SeenCompareAffinities.insert(Key).second)
-            R.CompareAffinities.push_back(CompareAffinity{A, B});
+          auto [AffinityIt, Inserted] =
+              AffinityKeyToIndex.try_emplace(Key, R.CompareAffinities.size());
+          if (Inserted)
+            R.CompareAffinities.push_back(CompareAffinity{A, B, 0});
+          ++R.CompareAffinities[AffinityIt->second].Weight;
         }
       }
     }
@@ -2439,7 +2445,7 @@ PreservedAnalyses WidthCandidatePrinter::run(Function &F,
   }
 
   for (const ComponentEdge &E : R.Edges)
-    OS << formatv("  edge {0} -> {1}\n", E.From, E.To);
+    OS << formatv("  edge {0} -> {1} weight={2}\n", E.From, E.To, E.Weight);
 
   return PreservedAnalyses::all();
 }
@@ -2470,7 +2476,8 @@ PreservedAnalyses WidthPlanPrinter::run(Function &F,
   }
 
   for (const CompareAffinity &A : R.CompareAffinities)
-    OS << formatv("  compare-affinity {0} <-> {1}\n", A.LHS, A.RHS);
+    OS << formatv("  compare-affinity {0} <-> {1} weight={2}\n", A.LHS, A.RHS,
+                  A.Weight);
 
   return PreservedAnalyses::all();
 }
