@@ -23,6 +23,7 @@
 #include "llvm/Support/FormatVariadic.h"
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/Transforms/Utils/Local.h"
+#include <cassert>
 #include <optional>
 
 using namespace llvm;
@@ -102,6 +103,8 @@ bool hasFixedIntegerSignature(const CallBase &CB) {
 }
 
 InstClass classifyInstruction(Instruction &I) {
+  // Width planning only makes sense for integer-typed values. Everything else
+  // is outside the search space.
   if (!isIntegerValue(&I))
     return InstClass::Ignore;
 
@@ -151,6 +154,9 @@ InstClass classifyInstruction(Instruction &I) {
 
 void addEqualWidthConstraints(Instruction &I,
                               EquivalenceClasses<const Value *> &EC) {
+  // These instructions are width-polymorphic in the sense that we either want
+  // to retarget the whole group together or not at all. The union-find step
+  // compresses that equal-width region before any expensive reasoning happens.
   if (!isIntegerValue(&I))
     return;
 
@@ -190,6 +196,7 @@ bool shouldTrackValue(const Value *V) {
 }
 
 unsigned getValueWidth(const Value *V) {
+  assert(isa<IntegerType>(V->getType()) && "Expected integer-typed value");
   return cast<IntegerType>(V->getType())->getBitWidth();
 }
 
@@ -270,6 +277,8 @@ bool isSignedICmp(ICmpInst::Predicate Pred) {
 
 unsigned computeShrinkWidth(ICmpInst::Predicate Pred, const ExtOperandInfo &LHS,
                             const ExtOperandInfo &RHS) {
+  assert(LHS.Kind != ExtKind::None && RHS.Kind != ExtKind::None &&
+         "Shrink rules require explicit extension structure");
   if (LHS.WideWidth != RHS.WideWidth)
     return 0;
 
@@ -300,6 +309,7 @@ unsigned computeShrinkWidth(ICmpInst::Predicate Pred, const ExtOperandInfo &LHS,
 Value *materializeAtWidth(IRBuilder<> &B, const ExtOperandInfo &Info,
                           unsigned TargetWidth) {
   assert(TargetWidth >= Info.NarrowWidth && "Cannot shrink below source width");
+  assert(Info.Kind != ExtKind::None && "Expected explicit extension kind");
 
   if (TargetWidth == Info.NarrowWidth)
     return Info.NarrowValue;
@@ -656,6 +666,9 @@ bool tryConvertSExtToNonNegZExt(SExtInst &Ext, LazyValueInfo &LVI) {
 }
 
 void inferCandidatesFromInstruction(Instruction &I, AnalysisResult &R) {
+  // Candidate widths are intentionally cheap and local. This is not a legality
+  // proof; it is only a way to seed the planner with widths that are already
+  // suggested by ext/trunc structure in the current IR.
   if (auto *Ext = dyn_cast<ZExtInst>(&I)) {
     unsigned SrcW = getValueWidth(Ext->getOperand(0));
     unsigned DstW = getValueWidth(Ext);
@@ -740,6 +753,8 @@ Value *materializeValueAtWidth(Value *V, ExtKind Kind, unsigned TargetWidth,
   IRBuilder<> B(InsertBefore);
   if (TargetWidth < CurrentWidth)
     return B.CreateTrunc(V, TargetTy);
+  assert(Kind != ExtKind::None &&
+         "Need an extension kind when materializing a wider value");
   switch (Kind) {
   case ExtKind::ZExt:
     return B.CreateZExt(V, TargetTy);
@@ -769,6 +784,9 @@ unsigned scoreWidthChoice(const AnalysisResult &R,
 }
 
 bool preferOrigWidthOnTie(const Component &C) {
+  // Single cast nodes are natural boundaries. Preferring their original width
+  // on a tie avoids trivial oscillation and gives neighboring wider components
+  // a chance to absorb them only when that strictly improves cut cost.
   return C.Instructions.size() == 1 &&
          (isa<ZExtInst>(C.Instructions.front()) ||
           isa<SExtInst>(C.Instructions.front()) ||
@@ -794,14 +812,19 @@ bool isBetterWidthChoice(const Component &C, unsigned CandidateWidth,
 PlanResult computeWidthPlan(const AnalysisResult &R) {
   PlanResult Plan;
   Plan.ChosenWidths.reserve(R.Components.size());
-  for (const Component &C : R.Components)
+  for (const Component &C : R.Components) {
+    assert(C.ID == Plan.ChosenWidths.size() &&
+           "Component IDs should be dense and zero-based");
     Plan.ChosenWidths.push_back(C.OrigWidth);
+  }
 
   unsigned MaxRounds = std::max<unsigned>(1, R.Components.size() * 4);
   for (unsigned Round = 0; Round != MaxRounds; ++Round) {
     bool Changed = false;
 
     for (const Component &C : R.Components) {
+      assert(C.ID < Plan.ChosenWidths.size() &&
+             "Planner state must cover every component");
       if (C.Fixed)
         continue;
 
@@ -839,6 +862,9 @@ PlanResult computeWidthPlan(const AnalysisResult &R) {
 }
 
 AnalysisResult computeWidthComponents(Function &F) {
+  // Build width components first, before candidate generation or planning.
+  // This keeps later reasoning at component granularity instead of raw SSA
+  // value granularity.
   EquivalenceClasses<const Value *> EC;
   DenseSet<const Value *> TrackedValues;
   for (Argument &Arg : F.args()) {
@@ -877,6 +903,7 @@ AnalysisResult computeWidthComponents(Function &F) {
 
     unsigned ID = It->second;
     R.ValueToComponent[V] = ID;
+    assert(ID < R.Components.size() && "Component ID out of range");
     Component &C = R.Components[ID];
     C.OrigWidth = std::max(C.OrigWidth, getValueWidth(V));
     C.Fixed |= isAnchorValue(V);
@@ -916,6 +943,9 @@ struct ExternalExtUser {
 };
 
 bool isWidenablePolyInstruction(Instruction &I) {
+  // These are the operations we currently know how to rebuild uniformly at a
+  // larger width inside one component. Anything else stays outside the generic
+  // region widener for now.
   if (isa<PHINode>(I) || isa<SelectInst>(I) || isa<FreezeInst>(I))
     return true;
 
@@ -935,6 +965,8 @@ bool isWidenablePolyInstruction(Instruction &I) {
 
 bool tryWidenComponentFromPlan(const Component &C, const AnalysisResult &R,
                                const PlanResult &Plan) {
+  assert(C.ID < Plan.ChosenWidths.size() &&
+         "Planner state must cover every component");
   if (C.Fixed || C.Instructions.empty())
     return false;
 
@@ -946,6 +978,9 @@ bool tryWidenComponentFromPlan(const Component &C, const AnalysisResult &R,
   for (Value *V : C.Values)
     ComponentValues.insert(V);
 
+  // The generic widener only handles small width-polymorphic regions. As soon
+  // as a component contains something we cannot rebuild structurally, we leave
+  // it to narrower local folds or future legality work.
   for (Instruction *I : C.Instructions)
     if (!isWidenablePolyInstruction(*I))
       return false;
@@ -983,6 +1018,11 @@ bool tryWidenComponentFromPlan(const Component &C, const AnalysisResult &R,
       if (getValueWidth(S) == TargetWidth)
         SawSExtToTarget = true;
 
+  // Policy choice: prefer a zero-extended internal representation unless all
+  // target-width consumers specifically want sign extension. Zero extension is
+  // the more neutral choice because we can always reconstruct the original
+  // narrow value with a truncation at the boundary and then re-extend it per
+  // edge when needed.
   ExtKind InternalKind =
       SawSExtToTarget && !SawZExtToTarget ? ExtKind::SExt : ExtKind::ZExt;
 
@@ -990,6 +1030,8 @@ bool tryWidenComponentFromPlan(const Component &C, const AnalysisResult &R,
                                     TargetWidth);
   DenseMap<Value *, Value *> NewValues;
 
+  // PHIs must be created first so that later instructions in the component can
+  // refer to the widened region without worrying about cycles.
   for (Instruction *I : C.Instructions) {
     if (auto *Phi = dyn_cast<PHINode>(I)) {
       auto *NewPhi = PHINode::Create(TargetTy, Phi->getNumIncomingValues(), "",
@@ -1102,14 +1144,19 @@ bool tryWidenComponentFromPlan(const Component &C, const AnalysisResult &R,
       return false;
     }
 
+    // Remaining instructions should form an acyclic use graph once PHIs are
+    // removed. If we stop making progress, this component shape is outside the
+    // current rebuilder.
     if (!Progress)
       return false;
   }
 
+  // Each outgoing edge gets its own reconstruction policy. Matching wide
+  // extension users can disappear entirely; everything else is repaired from
+  // the widened value through an explicit boundary cast.
   for (const ExternalExtUser &EU : ExternalUsers) {
     Value *NewV = NewValues.lookup(EU.OldValue);
-    if (!NewV)
-      return false;
+    assert(NewV && "Every component value should have a widened replacement");
 
     if (auto *Z = dyn_cast<ZExtInst>(EU.User)) {
       if (getValueWidth(Z) == TargetWidth && InternalKind == ExtKind::ZExt) {
@@ -1129,9 +1176,13 @@ bool tryWidenComponentFromPlan(const Component &C, const AnalysisResult &R,
 
     Value *Boundary =
         materializeValueAtWidth(NewV, InternalKind, C.OrigWidth, EU.User);
+    assert(getValueWidth(Boundary) == C.OrigWidth &&
+           "Boundary repair should recreate the original component width");
     EU.User->replaceUsesOfWith(EU.OldValue, Boundary);
   }
 
+  // At this point all external uses should have been redirected either to the
+  // widened region directly or to explicit boundary conversions.
   for (Instruction *I : C.Instructions)
     if (!I->use_empty())
       I->replaceAllUsesWith(PoisonValue::get(I->getType()));
@@ -1265,6 +1316,8 @@ PreservedAnalyses WidthOptPass::run(Function &F, FunctionAnalysisManager &AM) {
 
   bool Changed = false;
 
+  // Run small local canonicalizations first. They simplify the IR, improve the
+  // candidate-width graph, and expose cleaner regions for the global planner.
   for (SExtInst *SExt : SExts) {
     if (SExt->getParent() == nullptr)
       continue;
@@ -1300,6 +1353,8 @@ PreservedAnalyses WidthOptPass::run(Function &F, FunctionAnalysisManager &AM) {
   AnalysisResult R = computeWidthComponents(F);
   PlanResult Plan = computeWidthPlan(R);
 
+  // The plan is currently consumed only by widening transforms. Narrowing is
+  // still handled by the local folds above.
   for (const Component &C : R.Components)
     Changed |= tryWidenComponentFromPlan(C, R, Plan);
 
