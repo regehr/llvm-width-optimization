@@ -496,10 +496,28 @@ bool tryWidenTruncZeroExtendedICmp(ICmpInst &Cmp, const DataLayout &DL,
     if (!areHighBitsKnownZero(Wide, NarrowWidth, DL, AC, DT, &Cmp))
       return false;
 
+    unsigned AddedBoundaryCost = 0;
+    unsigned RemovedBoundaryCost = Tr->hasOneUse() ? 1 : 0;
+    auto OtherExt = getExtOperandInfo(Other);
+    if (OtherExt && OtherExt->Kind == ExtKind::ZExt &&
+        OtherExt->WideWidth == NarrowWidth) {
+      if (!isa<Constant>(OtherExt->NarrowValue))
+        AddedBoundaryCost = 1;
+      if (OtherExt->Producer->hasOneUse())
+        ++RemovedBoundaryCost;
+    } else if (!isa<Constant>(Other)) {
+      AddedBoundaryCost = 1;
+    }
+
+    // Widening this compare is only worthwhile when any new zero-extension
+    // is paid for by removable boundary instructions around the compare.
+    if (AddedBoundaryCost > RemovedBoundaryCost)
+      return false;
+
     IRBuilder<> B(&Cmp);
     Value *WideOther = Other;
     if (WideWidth != NarrowWidth) {
-      if (auto OtherExt = getExtOperandInfo(Other)) {
+      if (OtherExt) {
         if (OtherExt->Kind == ExtKind::ZExt &&
             OtherExt->WideWidth == NarrowWidth) {
           WideOther = materializeAtWidth(B, *OtherExt, WideWidth);
