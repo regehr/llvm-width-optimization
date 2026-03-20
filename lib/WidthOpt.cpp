@@ -1229,6 +1229,26 @@ bool tryShrinkTruncOfAdd(TruncInst &Tr) {
   assert(TargetWidth < SourceWidth &&
          "Trunc results must be narrower than their source");
 
+  unsigned AddedBoundaryCost = 0;
+  unsigned RemovedBoundaryCost = 1; // The root trunc always disappears.
+  auto assessOperand = [&](Value *V) {
+    if (auto Ext = getExtOperandInfo(V)) {
+      if (Ext->NarrowWidth == TargetWidth && Ext->Producer->hasOneUse())
+        ++RemovedBoundaryCost;
+      return;
+    }
+    if (isa<ConstantInt>(V))
+      return;
+    ++AddedBoundaryCost;
+  };
+  assessOperand(BO->getOperand(0));
+  assessOperand(BO->getOperand(1));
+
+  // Rebuild the add at the narrow width only when removable boundary
+  // instructions around the region pay for any new operand truncations.
+  if (AddedBoundaryCost > RemovedBoundaryCost)
+    return false;
+
   IRBuilder<> B(&Tr);
   auto *TargetTy = IntegerType::get(Tr.getContext(), TargetWidth);
   auto materializeOperand = [&](Value *V) -> Value * {
