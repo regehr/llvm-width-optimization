@@ -1142,9 +1142,11 @@ bool tryFoldZExtOfTruncToMask(ZExtInst &Ext) {
   auto *Tr = dyn_cast<TruncInst>(Ext.getOperand(0));
   if (!Tr)
     return false;
+  if (!isIntegerValue(&Ext) || !isIntegerValue(Tr) ||
+      !isIntegerValue(Tr->getOperand(0)))
+    return false;
 
   Value *Src = Tr->getOperand(0);
-  assert(isIntegerValue(Src) && "Expected integer source for trunc");
   unsigned SrcWidth = getValueWidth(Src);
   unsigned NarrowWidth = getValueWidth(Tr);
   unsigned WideWidth = getValueWidth(&Ext);
