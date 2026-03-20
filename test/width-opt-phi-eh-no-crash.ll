@@ -1,6 +1,7 @@
 ; EH blocks such as catchswitch headers may have PHIs but no legal insertion
 ; point for rebuilding a widened cast after the PHIs. The pass should leave
 ; those PHIs alone rather than crashing.
+; no-alive: Alive2 does not support the invoke-based EH structure in this test.
 ; RUN: opt -load-pass-plugin %shlibdir/libWidthOpt%shlibext \
 ; RUN:   -passes='width-opt' -S %s | FileCheck %s
 

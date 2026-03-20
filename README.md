@@ -163,6 +163,9 @@ By default, the script uses:
 
 These can be overridden with `--opt-bin`, `--alive-tv`, and `--plugin`.
 
+Tests tagged with `no-alive` are skipped by this script. Use that tag only
+for cases that Alive2 cannot currently model, such as unsupported EH forms.
+
 Verbose mode prints the source and optimized IR text for each file:
 
 ```bash

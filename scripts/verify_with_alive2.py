@@ -11,6 +11,7 @@ from typing import List, Optional
 DEFAULT_OPT = Path("/Users/regehr/llvm-project/for-alive/bin/opt")
 DEFAULT_ALIVE_TV = Path("/Users/regehr/alive2-regehr/build/alive-tv")
 DEFAULT_PLUGIN = Path("/Users/regehr/tmp/llvm-width-optimization-build/lib/libWidthOpt.dylib")
+NO_ALIVE_TAG = "no-alive"
 
 
 def run(cmd: List[str], *, cwd: Optional[Path] = None) -> subprocess.CompletedProcess:
@@ -62,6 +63,16 @@ def collect_tests(repo_root: Path, directories: List[str]) -> List[Path]:
         test_dir = repo_root / directory
         tests.extend(sorted(test_dir.glob("*.ll")))
     return tests
+
+
+def has_no_alive_tag(path: Path) -> bool:
+    try:
+        for line in path.read_text().splitlines():
+            if NO_ALIVE_TAG in line:
+                return True
+    except OSError as exc:
+        print(f"warning: failed to read {path}: {exc}", file=sys.stderr)
+    return False
 
 
 def print_failure(kind: str, path: Path, proc: subprocess.CompletedProcess[str]) -> None:
@@ -136,9 +147,15 @@ def main() -> int:
         return 1
 
     failures = 0
+    skipped = 0
     with tempfile.TemporaryDirectory(prefix="width-opt-alive2-") as tmp:
         tmpdir = Path(tmp)
         for test in tests:
+            if has_no_alive_tag(test):
+                print(f"SKIP {test.relative_to(repo_root)}: {NO_ALIVE_TAG}")
+                skipped += 1
+                continue
+
             optimized = tmpdir / f"{test.stem}.opt.ll"
 
             opt_proc = optimize_file(opt_bin, plugin, test, optimized)
@@ -164,7 +181,7 @@ def main() -> int:
         print(f"\n{failures} file(s) failed", file=sys.stderr)
         return 1
 
-    print(f"\nVerified {len(tests)} file(s).")
+    print(f"\nVerified {len(tests) - skipped} file(s), skipped {skipped}.")
     return 0
 
 
