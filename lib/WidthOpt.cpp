@@ -690,7 +690,10 @@ bool tryShrinkPhiOfExts(PHINode &Phi) {
   for (unsigned I = 0, E = NarrowIncomingValues.size(); I != E; ++I)
     NarrowPhi->addIncoming(NarrowIncomingValues[I], IncomingBlocks[I]);
 
-  Instruction *InsertPt = &*Phi.getParent()->getFirstInsertionPt();
+  auto InsertIt = Phi.getParent()->getFirstInsertionPt();
+  if (InsertIt == Phi.getParent()->end())
+    return false;
+  Instruction *InsertPt = &*InsertIt;
   IRBuilder<> B(InsertPt);
   Instruction *Wide = nullptr;
   if (Info.Kind == ExtKind::ZExt)
