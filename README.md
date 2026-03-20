@@ -243,15 +243,8 @@ proof and regression discipline.
 
 ### Concrete TODOs from the LLVM precision oracle
 
-- use `scripts/compare_width_precision.py` as a standing precision oracle and
-  close the current LLVM-win gaps below
-- relax shared-extension merge handling so the pass keeps up with LLVM on the
-  remaining conditional-dataflow case
-  Current oracle losses: `test/width-opt-select-shared-ext-user-repair.ll`.
 - handle vector instructions
 - broaden trunc-rooted shrinking beyond the current low-bit-preserving
   binops, `select`, and shift-recurrence cases
 - add more direct profitability modeling so local widen/narrow decisions align
   better with the global objective
-- add fresh regression cases under `test/` as new optimizer gaps are
-  discovered
