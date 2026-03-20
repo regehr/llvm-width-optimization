@@ -1351,6 +1351,56 @@ Value *materializeTruncRootedValueAtWidth(Value *V, unsigned TargetWidth,
   return nullptr;
 }
 
+bool collectTruncRootedValueCost(
+    Value *V, unsigned TargetWidth, SmallPtrSetImpl<Value *> &AddedValues,
+    SmallPtrSetImpl<Instruction *> &RemovedInstructions,
+    SmallPtrSetImpl<Value *> &Visited) {
+  if (!isIntegerValue(V))
+    return false;
+  if (!Visited.insert(V).second)
+    return true;
+
+  unsigned Width = getValueWidth(V);
+  if (Width == TargetWidth)
+    return true;
+
+  if (auto Ext = getExtOperandInfo(V)) {
+    if (TargetWidth < Ext->NarrowWidth || TargetWidth > Ext->WideWidth)
+      return false;
+    if (TargetWidth != Ext->NarrowWidth)
+      AddedValues.insert(V);
+    if (Ext->Producer->hasOneUse())
+      RemovedInstructions.insert(Ext->Producer);
+    return true;
+  }
+
+  if (isa<ConstantInt>(V))
+    return true;
+
+  if (auto *BO = dyn_cast<BinaryOperator>(V)) {
+    if (BO->getOpcode() == Instruction::Sub) {
+      auto *Zero = dyn_cast<ConstantInt>(BO->getOperand(0));
+      if (Zero && Zero->isZero()) {
+        if (!collectTruncRootedValueCost(BO->getOperand(1), TargetWidth,
+                                         AddedValues, RemovedInstructions,
+                                         Visited))
+          return false;
+        AddedValues.insert(V);
+        if (BO->hasOneUse())
+          RemovedInstructions.insert(BO);
+        return true;
+      }
+    }
+  }
+
+  if (Width > TargetWidth) {
+    AddedValues.insert(V);
+    return true;
+  }
+
+  return false;
+}
+
 bool tryShrinkTruncOfSelect(TruncInst &Tr) {
   auto *Sel = dyn_cast<SelectInst>(Tr.getOperand(0));
   if (!Sel || !Sel->hasOneUse())
@@ -1362,6 +1412,25 @@ bool tryShrinkTruncOfSelect(TruncInst &Tr) {
   unsigned TargetWidth = getValueWidth(&Tr);
   unsigned SourceWidth = getValueWidth(Sel);
   if (TargetWidth >= SourceWidth)
+    return false;
+
+  SmallPtrSet<Value *, 8> AddedValues;
+  SmallPtrSet<Instruction *, 8> RemovedInstructions;
+  SmallPtrSet<Value *, 8> VisitedValues;
+  if (!collectTruncRootedValueCost(Sel->getTrueValue(), TargetWidth,
+                                   AddedValues, RemovedInstructions,
+                                   VisitedValues) ||
+      !collectTruncRootedValueCost(Sel->getFalseValue(), TargetWidth,
+                                   AddedValues, RemovedInstructions,
+                                   VisitedValues))
+    return false;
+
+  unsigned AddedInstructionCost = AddedValues.size();
+  unsigned RemovedInstructionCost = 1 + RemovedInstructions.size();
+
+  // Rebuild the select at the narrow width only when removable instructions
+  // around the region pay for any new arm materialization we introduce.
+  if (AddedInstructionCost > RemovedInstructionCost)
     return false;
 
   // Materialize each arm at the truncated width first, then rebuild the select
