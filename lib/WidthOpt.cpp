@@ -664,8 +664,6 @@ bool tryShrinkPhiOfExts(PHINode &Phi) {
 
   for (unsigned I = 0, E = Phi.getNumIncomingValues(); I != E; ++I) {
     Value *Incoming = Phi.getIncomingValue(I);
-    IncomingBlocks.push_back(Phi.getIncomingBlock(I));
-
     if (auto Ext = getExtOperandInfo(Incoming)) {
       if (Ext->WideWidth != WideTy->getBitWidth())
         return false;
@@ -679,27 +677,32 @@ bool tryShrinkPhiOfExts(PHINode &Phi) {
                  Info.WideWidth != Ext->WideWidth) {
         return false;
       }
+      continue;
+    }
 
+    if (!isa<ConstantInt>(Incoming))
+      return false;
+  }
+
+  if (!SawExt)
+    return false;
+
+  for (unsigned I = 0, E = Phi.getNumIncomingValues(); I != E; ++I) {
+    Value *Incoming = Phi.getIncomingValue(I);
+    IncomingBlocks.push_back(Phi.getIncomingBlock(I));
+
+    if (auto Ext = getExtOperandInfo(Incoming)) {
       NarrowIncomingValues.push_back(Ext->NarrowValue);
       Info.Producers.push_back(Ext->Producer);
       continue;
     }
 
-    auto *CI = dyn_cast<ConstantInt>(Incoming);
-    if (!CI)
-      return false;
-
-    if (!SawExt)
-      return false;
-
+    auto *CI = cast<ConstantInt>(Incoming);
     if (!canRepresentConstant(*CI, Info.Kind, Info.NarrowWidth))
       return false;
 
     NarrowIncomingValues.push_back(convertConstantToNarrow(*CI, Info.NarrowWidth));
   }
-
-  if (!SawExt)
-    return false;
 
   auto *NarrowTy = IntegerType::get(Phi.getContext(), Info.NarrowWidth);
   auto *NarrowPhi = PHINode::Create(NarrowTy, Phi.getNumIncomingValues(),
@@ -1900,6 +1903,158 @@ struct ExternalExtUser {
   Value *OldValue = nullptr;
 };
 
+struct LocalRewriteWorklists {
+  SmallVector<ICmpInst *, 16> Compares;
+  SmallVector<SelectInst *, 16> Selects;
+  SmallVector<PHINode *, 16> Phis;
+  SmallVector<SExtInst *, 16> SExts;
+  SmallVector<BinaryOperator *, 16> Adds;
+  SmallVector<BinaryOperator *, 16> Ands;
+  SmallVector<BinaryOperator *, 16> UDivs;
+  SmallVector<ZExtInst *, 16> ZExts;
+  SmallVector<TruncInst *, 16> Truncs;
+  SmallVector<FreezeInst *, 16> Freezes;
+};
+
+LocalRewriteWorklists collectLocalRewriteWorklists(Function &F) {
+  LocalRewriteWorklists WL;
+  for (Instruction &I : instructions(F))
+    if (auto *Cmp = dyn_cast<ICmpInst>(&I))
+      WL.Compares.push_back(Cmp);
+    else if (auto *Sel = dyn_cast<SelectInst>(&I))
+      WL.Selects.push_back(Sel);
+    else if (auto *Phi = dyn_cast<PHINode>(&I))
+      WL.Phis.push_back(Phi);
+    else if (auto *BO = dyn_cast<BinaryOperator>(&I)) {
+      if (BO->getOpcode() == Instruction::Add)
+        WL.Adds.push_back(BO);
+      else if (BO->getOpcode() == Instruction::And)
+        WL.Ands.push_back(BO);
+      else if (BO->getOpcode() == Instruction::UDiv)
+        WL.UDivs.push_back(BO);
+    } else if (auto *ZExt = dyn_cast<ZExtInst>(&I))
+      WL.ZExts.push_back(ZExt);
+    else if (auto *SExt = dyn_cast<SExtInst>(&I))
+      WL.SExts.push_back(SExt);
+    else if (auto *Tr = dyn_cast<TruncInst>(&I))
+      WL.Truncs.push_back(Tr);
+    else if (auto *FI = dyn_cast<FreezeInst>(&I))
+      WL.Freezes.push_back(FI);
+  return WL;
+}
+
+bool runAnalysisAwareLocalRewrites(Function &F, LazyValueInfo &LVI,
+                                   AssumptionCache &AC, DominatorTree &DT) {
+  const DataLayout &DL = F.getDataLayout();
+  LocalRewriteWorklists WL = collectLocalRewriteWorklists(F);
+  bool Changed = false;
+
+  for (BinaryOperator *UDiv : WL.UDivs) {
+    if (UDiv->getParent() == nullptr)
+      continue;
+    Changed |= tryNarrowUDivWithRange(*UDiv, LVI);
+  }
+
+  for (SExtInst *SExt : WL.SExts) {
+    if (SExt->getParent() == nullptr)
+      continue;
+    Changed |= tryConvertSExtToNonNegZExt(*SExt, LVI);
+  }
+
+  for (ICmpInst *Cmp : WL.Compares) {
+    if (Cmp->getParent() == nullptr)
+      continue;
+    if (tryWidenTruncEqualityICmp(*Cmp, DL, &AC, &DT)) {
+      Changed = true;
+      continue;
+    }
+    Changed |= tryWidenTruncZeroExtendedICmp(*Cmp, DL, &AC, &DT);
+  }
+
+  return Changed;
+}
+
+bool runStructuralLocalRewritesToFixpoint(Function &F) {
+  bool ChangedAny = false;
+
+  while (true) {
+    LocalRewriteWorklists WL = collectLocalRewriteWorklists(F);
+    bool ChangedThisRound = false;
+
+    for (BinaryOperator *Add : WL.Adds) {
+      if (Add->getParent() == nullptr)
+        continue;
+      ChangedThisRound |= tryWidenAddThroughZExt(*Add);
+    }
+
+    for (BinaryOperator *And : WL.Ands) {
+      if (And->getParent() == nullptr)
+        continue;
+      ChangedThisRound |= tryFoldAndOfSExtToZExt(*And);
+    }
+
+    for (ZExtInst *ZExt : WL.ZExts) {
+      if (ZExt->getParent() == nullptr)
+        continue;
+      ChangedThisRound |= tryFoldZExtOfTruncToMask(*ZExt);
+    }
+
+    for (TruncInst *Tr : WL.Truncs) {
+      if (Tr->getParent() == nullptr)
+        continue;
+      if (tryShrinkTruncOfShiftRecurrence(*Tr)) {
+        ChangedThisRound = true;
+        continue;
+      }
+      if (tryShrinkTruncOfSelect(*Tr)) {
+        ChangedThisRound = true;
+        continue;
+      }
+      ChangedThisRound |= tryShrinkTruncOfAdd(*Tr);
+    }
+
+    for (SExtInst *SExt : WL.SExts) {
+      if (SExt->getParent() == nullptr)
+        continue;
+      ChangedThisRound |= tryConvertWholeSExtToZExt(*SExt);
+    }
+
+    for (FreezeInst *FI : WL.Freezes) {
+      if (FI->getParent() == nullptr)
+        continue;
+      ChangedThisRound |= tryPushFreezeThroughExt(*FI);
+    }
+
+    for (ICmpInst *Cmp : WL.Compares) {
+      if (Cmp->getParent() == nullptr)
+        continue;
+      ChangedThisRound |= tryShrinkICmp(*Cmp);
+    }
+
+    for (SelectInst *Sel : WL.Selects) {
+      if (Sel->getParent() == nullptr)
+        continue;
+      if (tryConvertSelectToMinMax(*Sel)) {
+        ChangedThisRound = true;
+        continue;
+      }
+      ChangedThisRound |= tryShrinkSelectOfExts(*Sel);
+    }
+
+    for (PHINode *Phi : WL.Phis) {
+      if (Phi->getParent() == nullptr)
+        continue;
+      ChangedThisRound |= tryShrinkPhiOfExts(*Phi);
+    }
+
+    if (!ChangedThisRound)
+      break;
+    ChangedAny = true;
+  }
+
+  return ChangedAny;
+}
+
 bool canRetargetBoundaryCompare(ICmpInst::Predicate Pred, ExtKind InternalKind) {
   if (isEqOrNe(Pred))
     return InternalKind != ExtKind::None;
@@ -2324,129 +2479,14 @@ PreservedAnalyses WidthOptPass::run(Function &F, FunctionAnalysisManager &AM) {
   LazyValueInfo &LVI = AM.getResult<LazyValueAnalysis>(F);
   AssumptionCache &AC = AM.getResult<AssumptionAnalysis>(F);
   DominatorTree &DT = AM.getResult<DominatorTreeAnalysis>(F);
-  const DataLayout &DL = F.getDataLayout();
-
-  SmallVector<ICmpInst *, 16> Worklist;
-  SmallVector<SelectInst *, 16> Selects;
-  SmallVector<PHINode *, 16> Phis;
-  SmallVector<SExtInst *, 16> SExts;
-  SmallVector<BinaryOperator *, 16> Adds;
-  SmallVector<BinaryOperator *, 16> Ands;
-  SmallVector<BinaryOperator *, 16> UDivs;
-  SmallVector<ZExtInst *, 16> ZExts;
-  SmallVector<TruncInst *, 16> Truncs;
-  SmallVector<FreezeInst *, 16> Freezes;
-  for (Instruction &I : instructions(F))
-    if (auto *Cmp = dyn_cast<ICmpInst>(&I))
-      Worklist.push_back(Cmp);
-    else if (auto *Sel = dyn_cast<SelectInst>(&I))
-      Selects.push_back(Sel);
-    else if (auto *Phi = dyn_cast<PHINode>(&I))
-      Phis.push_back(Phi);
-    else if (auto *BO = dyn_cast<BinaryOperator>(&I)) {
-      if (BO->getOpcode() == Instruction::Add)
-        Adds.push_back(BO);
-      else if (BO->getOpcode() == Instruction::And)
-        Ands.push_back(BO);
-      else if (BO->getOpcode() == Instruction::UDiv)
-        UDivs.push_back(BO);
-    } else if (auto *ZExt = dyn_cast<ZExtInst>(&I))
-      ZExts.push_back(ZExt);
-    else if (auto *SExt = dyn_cast<SExtInst>(&I))
-      SExts.push_back(SExt);
-    else if (auto *Tr = dyn_cast<TruncInst>(&I))
-      Truncs.push_back(Tr);
-    else if (auto *FI = dyn_cast<FreezeInst>(&I))
-      Freezes.push_back(FI);
 
   bool Changed = false;
 
-  // Run local rewrites first. They do most of the current narrowing work,
-  // simplify the IR seen by component analysis, and expose cleaner widening
-  // opportunities for the plan-driven phase at the end of the pass.
-  for (BinaryOperator *Add : Adds) {
-    if (Add->getParent() == nullptr)
-      continue;
-    Changed |= tryWidenAddThroughZExt(*Add);
-  }
-
-  for (BinaryOperator *And : Ands) {
-    if (And->getParent() == nullptr)
-      continue;
-    Changed |= tryFoldAndOfSExtToZExt(*And);
-  }
-
-  for (BinaryOperator *UDiv : UDivs) {
-    if (UDiv->getParent() == nullptr)
-      continue;
-    Changed |= tryNarrowUDivWithRange(*UDiv, LVI);
-  }
-
-  for (ZExtInst *ZExt : ZExts) {
-    if (ZExt->getParent() == nullptr)
-      continue;
-    Changed |= tryFoldZExtOfTruncToMask(*ZExt);
-  }
-
-  for (TruncInst *Tr : Truncs) {
-    if (Tr->getParent() == nullptr)
-      continue;
-    if (tryShrinkTruncOfShiftRecurrence(*Tr)) {
-      Changed = true;
-      continue;
-    }
-    if (tryShrinkTruncOfSelect(*Tr)) {
-      Changed = true;
-      continue;
-    }
-    Changed |= tryShrinkTruncOfAdd(*Tr);
-  }
-
-  for (SExtInst *SExt : SExts) {
-    if (SExt->getParent() == nullptr)
-      continue;
-    if (tryConvertWholeSExtToZExt(*SExt)) {
-      Changed = true;
-      continue;
-    }
-    Changed |= tryConvertSExtToNonNegZExt(*SExt, LVI);
-  }
-
-  for (FreezeInst *FI : Freezes) {
-    if (FI->getParent() == nullptr)
-      continue;
-    Changed |= tryPushFreezeThroughExt(*FI);
-  }
-
-  for (ICmpInst *Cmp : Worklist) {
-    if (Cmp->getParent() == nullptr)
-      continue;
-    if (tryWidenTruncEqualityICmp(*Cmp, DL, &AC, &DT)) {
-      Changed = true;
-      continue;
-    }
-    if (tryWidenTruncZeroExtendedICmp(*Cmp, DL, &AC, &DT)) {
-      Changed = true;
-      continue;
-    }
-    Changed |= tryShrinkICmp(*Cmp);
-  }
-
-  for (SelectInst *Sel : Selects) {
-    if (Sel->getParent() == nullptr)
-      continue;
-    if (tryConvertSelectToMinMax(*Sel)) {
-      Changed = true;
-      continue;
-    }
-    Changed |= tryShrinkSelectOfExts(*Sel);
-  }
-
-  for (PHINode *Phi : Phis) {
-    if (Phi->getParent() == nullptr)
-      continue;
-    Changed |= tryShrinkPhiOfExts(*Phi);
-  }
+  // Run analysis-driven local rewrites once using the current analysis
+  // snapshots, then iterate the purely structural local rewrites to a fixed
+  // point so one local fold can expose another later in the pass.
+  Changed |= runAnalysisAwareLocalRewrites(F, LVI, AC, DT);
+  Changed |= runStructuralLocalRewritesToFixpoint(F);
 
   AnalysisResult R = computeWidthComponents(F);
   PlanResult Plan = computeWidthPlan(R);

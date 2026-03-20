@@ -11,8 +11,8 @@ entry:
 }
 
 ; CHECK-LABEL: define i1 @f(
-; CHECK: %wide = zext i8 %x to i32
 ; CHECK: %sy = sext i8 %y to i16
-; CHECK: %[[WIDEY:.*]] = zext i16 %sy to i32
-; CHECK: %cmp = icmp ult i32 %wide, %[[WIDEY]]
-; CHECK: ret i1 %cmp
+; CHECK: %[[X16:.*]] = zext i8 %x to i16
+; CHECK: %[[CMP:.*]] = icmp ult i16 %[[X16]], %sy
+; CHECK-NOT: icmp ult i32
+; CHECK: ret i1 %[[CMP]]

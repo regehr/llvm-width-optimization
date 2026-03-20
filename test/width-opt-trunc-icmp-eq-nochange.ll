@@ -16,8 +16,7 @@ entry:
 }
 
 ; CHECK-LABEL: define i1 @f(
-; CHECK: %x16 = trunc i32 %x to i16
-; CHECK: %[[X32:.*]] = zext i16 %x16 to i32
-; CHECK-NOT: %y16 = trunc i32 %y to i16
-; CHECK: %cmp = icmp eq i32 %[[X32]], %y
+; CHECK-NOT: trunc i32
+; CHECK: %[[XLOW:.*]] = and i32 %x, 65535
+; CHECK: %cmp = icmp eq i32 %[[XLOW]], %y
 ; CHECK: ret i1 %cmp

@@ -224,13 +224,6 @@ proof and regression discipline.
   `freeze`, `and`, `or`, and `xor`. That mismatch lets neighboring components
   optimize against width choices that never materialize, which directly weakens
   the final result.
-- make the pass iterate to a fixed point instead of running each rewrite family
-  once over a snapshot worklist
-  Several currently supported transforms can expose other currently supported
-  transforms later in the pass. In particular, compare shrinking runs before
-  `phi` and `select` shrinking, so a newly narrowed `phi` or `select` can
-  create an ext/ext compare shape that is never revisited. Re-running the
-  local rewrites until they stabilize should recover these missed reductions.
 - remove input-order sensitivity from `phi` shrinking
   The current `phi` shrinker gives up if it sees a constant incoming before it
   has seen the first extension incoming, even when the PHI is otherwise fully
