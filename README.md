@@ -224,11 +224,6 @@ proof and regression discipline.
   `freeze`, `and`, `or`, and `xor`. That mismatch lets neighboring components
   optimize against width choices that never materialize, which directly weakens
   the final result.
-- remove input-order sensitivity from `phi` shrinking
-  The current `phi` shrinker gives up if it sees a constant incoming before it
-  has seen the first extension incoming, even when the PHI is otherwise fully
-  shrinkable. Since PHI incoming order is arbitrary, the same reducible PHI can
-  optimize or fail purely based on edge ordering.
 - relax `phi` and `select` shrinking so they can use a common intermediate
   width instead of requiring all extension arms to have the exact same narrow
   width
