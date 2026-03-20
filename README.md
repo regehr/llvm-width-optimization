@@ -214,3 +214,4 @@ proof and regression discipline.
   better with the global objective
 - add new external baseline cases under `tests/` as fresh gaps are discovered,
   and keep promoting them into `test/` once supported
+- make everything work for vector instructions
