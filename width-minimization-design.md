@@ -59,7 +59,9 @@ Implemented today:
 - range-driven `udiv` narrowing
 - local widening of a `zext -> add -> zext` chain into a reused wider path
 - plan-driven widening of small width-polymorphic components
-  - currently `phi`, `select`, `freeze`, `and`, `or`, `xor`
+  - currently `phi`, `select`, `freeze`, `and`, `or`, `xor`, plus singleton
+    `zext`, `sext`, `trunc`, and width-polymorphic min/max intrinsic
+    components
 - target-width-extension-aware sign selection inside widened components so the
   internal representation matches the dominant removable `zext`/`sext`
   boundary kind
@@ -68,8 +70,9 @@ Implemented today:
   internal value
 - planner-side compare affinities so `icmp` operands can pull component widths
   toward agreement
-- weighted planner pressure for repeated def-use boundaries and repeated
-  compare affinities between the same component pairs
+- weighted planner pressure for repeated def-use boundaries, fixed external
+  anchor uses, extension-kind mismatches at target width, and repeated compare
+  affinities between the same component pairs
 
 Current policy boundaries:
 

@@ -28,12 +28,14 @@ The repository currently contains:
 - a candidate-width analysis that infers alternative widths from ext/trunc use
   patterns
 - a first width-plan analysis that chooses per-component widths with a simple
-  graph-labeling heuristic and weighted boundary pressure
+  graph-labeling heuristic with weighted boundary pressure, anchor pressure
+  from fixed external uses, and extension-kind-aware mismatch penalties
 - planner-side compare affinities so `icmp` operands can influence width
   choice directly
 - a growing set of conservative local rewrites for compare, trunc-rooted, and
   range-driven patterns
 - conservative plan-driven widening rewrites for small width-polymorphic
+  components plus singleton `zext`, `sext`, `trunc`, and min/max intrinsic
   components
 - a lit regression suite that now covers all former baseline corpus cases
 - an Alive2 validation script, including a `--verbose` mode that prints source
@@ -41,9 +43,11 @@ The repository currently contains:
 
 The current optimizer is still conservative, but it is no longer purely local.
 The global plan now drives widening of small width-polymorphic components and
-uses compare affinities plus weighted repeated boundary pressure to influence
-width choices. At the same time, a large fraction of the implemented behavior
-currently comes from targeted local rewrites that complement the planner.
+uses compare affinities plus weighted repeated boundary pressure, anchor
+pressure from fixed external uses, and extension-kind-aware mismatch penalties
+to influence width choices. At the same time, a large fraction of the
+implemented behavior currently comes from targeted local rewrites that
+complement the planner.
 
 ## Implemented Local Rewrites
 
@@ -84,7 +88,8 @@ currently comes from targeted local rewrites that complement the planner.
 - local widening of `zext -> add -> zext` chains to reuse an existing wider
   extension path
 - plan-driven widening of components built from `phi`, `select`, `freeze`,
-  `and`, `or`, and `xor`
+  `and`, `or`, and `xor`, plus singleton `zext`, `sext`, `trunc`, and
+  width-polymorphic min/max intrinsic components
 - target-width-extension-aware sign selection for widened components so the
   internal representation matches the dominant removable boundary casts
 - per-edge boundary repair for widened components, including retargeting
@@ -223,21 +228,18 @@ proof and regression discipline.
 
 ### Concrete TODOs from a `lib/WidthOpt.cpp` review
 
-- fix the planner cost model so it counts all boundary pressure instead of
-  collapsing each component pair to a single unit-cost edge or compare
-  affinity
-- align planner-side movable components with what the executor can actually
-  rebuild
-  Today the analysis and planner can choose widths for components containing
-  `icmp`, `zext`, `sext`, and `trunc`, but the plan consumer only realizes
-  widenings for small width-polymorphic regions built from `phi`, `select`,
-  `freeze`, `and`, `or`, and `xor`. That mismatch lets neighboring components
-  optimize against width choices that never materialize, which directly weakens
-  the final result.
+- fix the planner cost model so it matches realizable boundary elimination
+  instead of treating every width disagreement as the same unit-cost cut
+  Repeated def-use boundaries, fixed external anchor uses, and target-width
+  extension-kind mismatches are now modeled explicitly, but compare repair is
+  still priced too coarsely. The planner does not yet distinguish between
+  compares that can be retargeted cheaply and boundaries that require
+  recreating casts per external use.
 - generalize the global planner beyond the current simple heuristic and binary
   candidate model
 - broaden plan-driven rewrites to more instruction kinds than the current small
-  width-polymorphic regions
+  width-polymorphic regions plus the currently supported singleton cast/minmax
+  cases
 - strengthen legality reasoning with more systematic known-bits, range, and
   demanded-bits integration
 

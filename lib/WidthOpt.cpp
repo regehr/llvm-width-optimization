@@ -1975,6 +1975,91 @@ unsigned compareAffinityCost(unsigned LHSWidth, unsigned RHSWidth) {
   return LHSWidth == RHSWidth ? 0u : 1u;
 }
 
+unsigned anchorPressureCost(unsigned ChosenWidth, unsigned AnchorWidth) {
+  return ChosenWidth == AnchorWidth ? 0u : 1u;
+}
+
+std::optional<ExtKind> getPreferredInternalKindForWidth(const AnalysisResult &R,
+                                                        unsigned ComponentID,
+                                                        unsigned Width) {
+  const Component &C = R.Components[ComponentID];
+  if (Width <= C.OrigWidth)
+    return std::nullopt;
+
+  if (C.Instructions.size() == 1) {
+    Instruction *I = C.Instructions.front();
+    if (isa<ZExtInst>(I))
+      return ExtKind::ZExt;
+    if (isa<SExtInst>(I))
+      return ExtKind::SExt;
+    if (auto *CB = dyn_cast<CallBase>(I)) {
+      if (Function *Callee = CB->getCalledFunction()) {
+        switch (Callee->getIntrinsicID()) {
+        case Intrinsic::smax:
+        case Intrinsic::smin:
+          return ExtKind::SExt;
+        case Intrinsic::umax:
+        case Intrinsic::umin:
+          return ExtKind::ZExt;
+        default:
+          break;
+        }
+      }
+    }
+  }
+
+  unsigned NumZExt = 0;
+  unsigned NumSExt = 0;
+  for (const ExtensionPressure &E : R.ExtensionPressures) {
+    if (E.Source != ComponentID || E.Width != Width)
+      continue;
+    if (E.IsSExt)
+      NumSExt += E.Weight;
+    else
+      NumZExt += E.Weight;
+  }
+  return NumSExt > NumZExt ? ExtKind::SExt : ExtKind::ZExt;
+}
+
+unsigned extensionMismatchCost(const AnalysisResult &R,
+                               ArrayRef<unsigned> ChosenWidths,
+                               unsigned ComponentID, unsigned Width) {
+  auto InternalKind = getPreferredInternalKindForWidth(R, ComponentID, Width);
+  if (!InternalKind)
+    return 0;
+
+  unsigned Cost = 0;
+  for (const ExtensionPressure &E : R.ExtensionPressures) {
+    if (E.Source != ComponentID || E.Width != Width)
+      continue;
+    if (ChosenWidths[E.User] != Width)
+      continue;
+    ExtKind UserKind = E.IsSExt ? ExtKind::SExt : ExtKind::ZExt;
+    if (*InternalKind != UserKind)
+      Cost += E.Weight;
+  }
+  return Cost;
+}
+
+unsigned totalExtensionMismatchCost(const AnalysisResult &R,
+                                    ArrayRef<unsigned> ChosenWidths) {
+  unsigned Cost = 0;
+  for (const ExtensionPressure &E : R.ExtensionPressures) {
+    assert(E.Source < ChosenWidths.size() && E.User < ChosenWidths.size() &&
+           "Extension pressure should reference valid component IDs");
+    if (ChosenWidths[E.Source] != E.Width || ChosenWidths[E.User] != E.Width)
+      continue;
+    auto InternalKind =
+        getPreferredInternalKindForWidth(R, E.Source, ChosenWidths[E.Source]);
+    if (!InternalKind)
+      continue;
+    ExtKind UserKind = E.IsSExt ? ExtKind::SExt : ExtKind::ZExt;
+    if (*InternalKind != UserKind)
+      Cost += E.Weight;
+  }
+  return Cost;
+}
+
 unsigned scoreWidthChoice(const AnalysisResult &R,
                           ArrayRef<unsigned> ChosenWidths,
                           unsigned ComponentID, unsigned Width) {
@@ -1996,6 +2081,12 @@ unsigned scoreWidthChoice(const AnalysisResult &R,
     else if (A.RHS == ComponentID)
       Score += A.Weight * compareAffinityCost(ChosenWidths[A.LHS], Width);
   }
+  for (const AnchorPressure &A : R.AnchorPressures) {
+    if (A.Component != ComponentID)
+      continue;
+    Score += A.Weight * anchorPressureCost(Width, A.Width);
+  }
+  Score += extensionMismatchCost(R, ChosenWidths, ComponentID, Width);
   return Score;
 }
 
@@ -2084,6 +2175,13 @@ PlanResult computeWidthPlan(const AnalysisResult &R) {
         A.Weight *
         compareAffinityCost(Plan.ChosenWidths[A.LHS], Plan.ChosenWidths[A.RHS]);
   }
+  for (const AnchorPressure &A : R.AnchorPressures) {
+    assert(A.Component < Plan.ChosenWidths.size() &&
+           "Anchor pressure should reference a valid component ID");
+    Plan.TotalCutCost +=
+        A.Weight * anchorPressureCost(Plan.ChosenWidths[A.Component], A.Width);
+  }
+  Plan.TotalCutCost += totalExtensionMismatchCost(R, Plan.ChosenWidths);
 
   return Plan;
 }
@@ -2149,6 +2247,8 @@ AnalysisResult computeWidthComponents(Function &F) {
 
   DenseMap<uint64_t, unsigned> EdgeKeyToIndex;
   DenseMap<uint64_t, unsigned> AffinityKeyToIndex;
+  DenseMap<uint64_t, unsigned> AnchorKeyToIndex;
+  DenseMap<uint64_t, unsigned> ExtKeyToIndex;
   for (Instruction &I : instructions(F)) {
     // Ordinary cross-component def-use edges become cut candidates in the
     // planner: differing chosen widths here imply a boundary conversion.
@@ -2157,8 +2257,19 @@ AnalysisResult computeWidthComponents(Function &F) {
         continue;
       auto FromIt = R.ValueToComponent.find(Op);
       auto ToIt = R.ValueToComponent.find(&I);
-      if (FromIt == R.ValueToComponent.end() || ToIt == R.ValueToComponent.end())
+      if (FromIt == R.ValueToComponent.end())
         continue;
+      if (ToIt == R.ValueToComponent.end()) {
+        unsigned Width = getValueWidth(Op);
+        uint64_t Key = (uint64_t(FromIt->second) << 32) | uint64_t(Width);
+        auto [AnchorIt, Inserted] =
+            AnchorKeyToIndex.try_emplace(Key, R.AnchorPressures.size());
+        if (Inserted)
+          R.AnchorPressures.push_back(
+              AnchorPressure{FromIt->second, Width, 0});
+        ++R.AnchorPressures[AnchorIt->second].Weight;
+        continue;
+      }
       if (FromIt->second == ToIt->second)
         continue;
       uint64_t Key = (uint64_t(FromIt->second) << 32) | uint64_t(ToIt->second);
@@ -2166,6 +2277,30 @@ AnalysisResult computeWidthComponents(Function &F) {
       if (Inserted)
         R.Edges.push_back(ComponentEdge{FromIt->second, ToIt->second, 0});
       ++R.Edges[EdgeIt->second].Weight;
+
+      if (auto *Z = dyn_cast<ZExtInst>(&I)) {
+        if (Z->getOperand(0) == Op) {
+          uint64_t ExtKey = (uint64_t(FromIt->second) << 32) |
+                            uint64_t(ToIt->second);
+          auto [ExtIt, ExtInserted] =
+              ExtKeyToIndex.try_emplace((ExtKey << 1), R.ExtensionPressures.size());
+          if (ExtInserted)
+            R.ExtensionPressures.push_back(ExtensionPressure{
+                FromIt->second, ToIt->second, getValueWidth(Z), false, 0});
+          ++R.ExtensionPressures[ExtIt->second].Weight;
+        }
+      } else if (auto *S = dyn_cast<SExtInst>(&I)) {
+        if (S->getOperand(0) == Op) {
+          uint64_t ExtKey = (uint64_t(FromIt->second) << 32) |
+                            uint64_t(ToIt->second);
+          auto [ExtIt, ExtInserted] = ExtKeyToIndex.try_emplace(
+              (ExtKey << 1) | 1ull, R.ExtensionPressures.size());
+          if (ExtInserted)
+            R.ExtensionPressures.push_back(ExtensionPressure{
+                FromIt->second, ToIt->second, getValueWidth(S), true, 0});
+          ++R.ExtensionPressures[ExtIt->second].Weight;
+        }
+      }
     }
 
     if (auto *Cmp = dyn_cast<ICmpInst>(&I)) {
@@ -2477,6 +2612,43 @@ bool isWidenablePolyInstruction(Instruction &I) {
   }
 }
 
+enum class SingletonWidenKind {
+  None,
+  ZExt,
+  SExt,
+  Trunc,
+  SignedMinMax,
+  UnsignedMinMax,
+};
+
+SingletonWidenKind getSingletonWidenKind(const Component &C) {
+  if (C.Instructions.size() != 1)
+    return SingletonWidenKind::None;
+
+  Instruction *I = C.Instructions.front();
+  if (isa<ZExtInst>(I))
+    return SingletonWidenKind::ZExt;
+  if (isa<SExtInst>(I))
+    return SingletonWidenKind::SExt;
+  if (isa<TruncInst>(I))
+    return SingletonWidenKind::Trunc;
+  if (auto *CB = dyn_cast<CallBase>(I)) {
+    if (Function *Callee = CB->getCalledFunction()) {
+      switch (Callee->getIntrinsicID()) {
+      case Intrinsic::smax:
+      case Intrinsic::smin:
+        return SingletonWidenKind::SignedMinMax;
+      case Intrinsic::umax:
+      case Intrinsic::umin:
+        return SingletonWidenKind::UnsignedMinMax;
+      default:
+        break;
+      }
+    }
+  }
+  return SingletonWidenKind::None;
+}
+
 bool tryWidenComponentFromPlan(const Component &C, const AnalysisResult &R,
                                const PlanResult &Plan) {
   assert(C.ID < Plan.ChosenWidths.size() &&
@@ -2492,12 +2664,17 @@ bool tryWidenComponentFromPlan(const Component &C, const AnalysisResult &R,
   for (Value *V : C.Values)
     ComponentValues.insert(V);
 
-  // The generic widener only handles small width-polymorphic regions. As soon
-  // as a component contains something we cannot rebuild structurally, we leave
-  // it to narrower local folds or future legality work.
-  for (Instruction *I : C.Instructions)
-    if (!isWidenablePolyInstruction(*I))
-      return false;
+  SingletonWidenKind SingletonKind = getSingletonWidenKind(C);
+  if (SingletonKind == SingletonWidenKind::None ||
+      SingletonKind == SingletonWidenKind::Trunc) {
+    // The generic widener only handles small width-polymorphic regions. As
+    // soon as a component contains something we cannot rebuild structurally, we
+    // leave it to narrower local folds or future legality work.
+    for (Instruction *I : C.Instructions)
+      if (SingletonKind != SingletonWidenKind::Trunc &&
+          !isWidenablePolyInstruction(*I))
+        return false;
+  }
 
   unsigned NumZExtToTarget = 0;
   unsigned NumSExtToTarget = 0;
@@ -2530,53 +2707,131 @@ bool tryWidenComponentFromPlan(const Component &C, const AnalysisResult &R,
   // is some external pressure at the chosen target width to absorb.
   if (ExternalUsers.empty())
     return false;
+  if (SingletonKind == SingletonWidenKind::Trunc && NumZExtToTarget == 0 &&
+      NumSExtToTarget == 0)
+    return false;
 
-  // Policy choice: pick the target-width extension kind that eliminates the
-  // larger number of existing boundary casts. Ties still prefer zero
-  // extension because it remains the more neutral boundary representation.
-  ExtKind InternalKind = NumSExtToTarget > NumZExtToTarget ? ExtKind::SExt
-                                                           : ExtKind::ZExt;
+  ExtKind InternalKind = ExtKind::None;
+  if (SingletonKind == SingletonWidenKind::ZExt) {
+    // Ext singleton components keep their original signedness when widened:
+    // widening `zext` means rebuilding a larger `zext`, and likewise for
+    // `sext`.
+    InternalKind = ExtKind::ZExt;
+  } else if (SingletonKind == SingletonWidenKind::SExt) {
+    InternalKind = ExtKind::SExt;
+  } else if (SingletonKind == SingletonWidenKind::SignedMinMax) {
+    InternalKind = ExtKind::SExt;
+  } else if (SingletonKind == SingletonWidenKind::UnsignedMinMax) {
+    InternalKind = ExtKind::ZExt;
+  } else {
+    // Policy choice: pick the target-width extension kind that eliminates the
+    // larger number of existing boundary casts. Ties still prefer zero
+    // extension because it remains the more neutral boundary representation.
+    InternalKind = NumSExtToTarget > NumZExtToTarget ? ExtKind::SExt
+                                                     : ExtKind::ZExt;
+  }
 
   auto *TargetTy = IntegerType::get(C.Instructions.front()->getContext(),
                                     TargetWidth);
   DenseMap<Value *, Value *> NewValues;
 
+  if (SingletonKind == SingletonWidenKind::ZExt ||
+      SingletonKind == SingletonWidenKind::SExt) {
+    Instruction *I = C.Instructions.front();
+    IRBuilder<> B(I);
+    Instruction *WideCast = nullptr;
+    if (auto *Z = dyn_cast<ZExtInst>(I))
+      WideCast = cast<Instruction>(
+          B.CreateZExt(Z->getOperand(0), TargetTy, Z->getName()));
+    else if (auto *S = dyn_cast<SExtInst>(I))
+      WideCast = cast<Instruction>(
+          B.CreateSExt(S->getOperand(0), TargetTy, S->getName()));
+    else
+      llvm_unreachable("Only zext/sext singleton components force widen kind");
+    WideCast->setDebugLoc(I->getDebugLoc());
+    NewValues[I] = WideCast;
+  } else if (SingletonKind == SingletonWidenKind::Trunc) {
+    auto *Tr = cast<TruncInst>(C.Instructions.front());
+    IRBuilder<> B(Tr);
+    auto *NarrowTrunc = cast<Instruction>(
+        B.CreateTrunc(Tr->getOperand(0), Tr->getType(), Tr->getName() + ".n"));
+    NarrowTrunc->setDebugLoc(Tr->getDebugLoc());
+
+    Instruction *WideValue = nullptr;
+    if (InternalKind == ExtKind::ZExt)
+      WideValue = cast<Instruction>(
+          B.CreateZExt(NarrowTrunc, TargetTy, Tr->getName()));
+    else
+      WideValue = cast<Instruction>(
+          B.CreateSExt(NarrowTrunc, TargetTy, Tr->getName()));
+    WideValue->setDebugLoc(Tr->getDebugLoc());
+    NewValues[Tr] = WideValue;
+  } else if (SingletonKind == SingletonWidenKind::SignedMinMax ||
+             SingletonKind == SingletonWidenKind::UnsignedMinMax) {
+    auto *CB = cast<CallBase>(C.Instructions.front());
+    Function *Callee = CB->getCalledFunction();
+    assert(Callee && Callee->isIntrinsic() &&
+           "Min/max singleton widening expects an intrinsic callee");
+    Intrinsic::ID ID = Callee->getIntrinsicID();
+
+    IRBuilder<> B(CB);
+    Value *WideLHS =
+        materializeValueAtWidth(CB->getArgOperand(0), InternalKind, TargetWidth,
+                                CB);
+    Value *WideRHS =
+        materializeValueAtWidth(CB->getArgOperand(1), InternalKind, TargetWidth,
+                                CB);
+    if (!WideLHS || !WideRHS)
+      return false;
+
+    auto *WideCall =
+        cast<Instruction>(B.CreateBinaryIntrinsic(ID, WideLHS, WideRHS));
+    WideCall->setDebugLoc(CB->getDebugLoc());
+    WideCall->takeName(CB);
+    NewValues[CB] = WideCall;
+  }
+
   // PHIs must be created first so that later instructions in the component can
   // refer to the widened region without worrying about cycles.
-  for (Instruction *I : C.Instructions) {
-    if (auto *Phi = dyn_cast<PHINode>(I)) {
-      auto *NewPhi = PHINode::Create(TargetTy, Phi->getNumIncomingValues(), "",
-                                     Phi->getIterator());
-      NewPhi->setDebugLoc(Phi->getDebugLoc());
-      NewPhi->takeName(Phi);
-      NewValues[Phi] = NewPhi;
+  if (SingletonKind == SingletonWidenKind::None) {
+    for (Instruction *I : C.Instructions) {
+      if (auto *Phi = dyn_cast<PHINode>(I)) {
+        auto *NewPhi = PHINode::Create(TargetTy, Phi->getNumIncomingValues(),
+                                       "", Phi->getIterator());
+        NewPhi->setDebugLoc(Phi->getDebugLoc());
+        NewPhi->takeName(Phi);
+        NewValues[Phi] = NewPhi;
+      }
     }
   }
 
-  for (Instruction *I : C.Instructions) {
-    auto *Phi = dyn_cast<PHINode>(I);
-    if (!Phi)
-      continue;
-    auto *NewPhi = cast<PHINode>(NewValues[Phi]);
-    for (unsigned Idx = 0, E = Phi->getNumIncomingValues(); Idx != E; ++Idx) {
-      Value *Incoming = Phi->getIncomingValue(Idx);
-      BasicBlock *Pred = Phi->getIncomingBlock(Idx);
-      Value *WideIncoming = nullptr;
-      if (ComponentValues.count(Incoming))
-        WideIncoming = NewValues.lookup(Incoming);
-      else
-        WideIncoming =
-            materializeValueAtWidth(Incoming, InternalKind, TargetWidth,
-                                    Pred->getTerminator());
-      if (WideIncoming == nullptr)
-        return false;
-      NewPhi->addIncoming(WideIncoming, Pred);
+  if (SingletonKind == SingletonWidenKind::None) {
+    for (Instruction *I : C.Instructions) {
+      auto *Phi = dyn_cast<PHINode>(I);
+      if (!Phi)
+        continue;
+      auto *NewPhi = cast<PHINode>(NewValues[Phi]);
+      for (unsigned Idx = 0, E = Phi->getNumIncomingValues(); Idx != E;
+           ++Idx) {
+        Value *Incoming = Phi->getIncomingValue(Idx);
+        BasicBlock *Pred = Phi->getIncomingBlock(Idx);
+        Value *WideIncoming = nullptr;
+        if (ComponentValues.count(Incoming))
+          WideIncoming = NewValues.lookup(Incoming);
+        else
+          WideIncoming =
+              materializeValueAtWidth(Incoming, InternalKind, TargetWidth,
+                                      Pred->getTerminator());
+        if (WideIncoming == nullptr)
+          return false;
+        NewPhi->addIncoming(WideIncoming, Pred);
+      }
     }
   }
 
   unsigned Remaining = 0;
   for (Instruction *I : C.Instructions)
-    if (!isa<PHINode>(I))
+    if (!isa<PHINode>(I) && !NewValues.count(I))
       ++Remaining;
 
   while (Remaining != 0) {
@@ -2821,6 +3076,9 @@ PreservedAnalyses WidthPlanPrinter::run(Function &F,
   for (const CompareAffinity &A : R.CompareAffinities)
     OS << formatv("  compare-affinity {0} <-> {1} weight={2}\n", A.LHS, A.RHS,
                   A.Weight);
+  for (const AnchorPressure &A : R.AnchorPressures)
+    OS << formatv("  anchor-pressure component {0} -> i{1} weight={2}\n",
+                  A.Component, A.Width, A.Weight);
 
   return PreservedAnalyses::all();
 }

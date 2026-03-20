@@ -43,11 +43,27 @@ struct CompareAffinity {
   unsigned Weight = 0;
 };
 
+struct AnchorPressure {
+  unsigned Component = 0;
+  unsigned Width = 0;
+  unsigned Weight = 0;
+};
+
+struct ExtensionPressure {
+  unsigned Source = 0;
+  unsigned User = 0;
+  unsigned Width = 0;
+  bool IsSExt = false;
+  unsigned Weight = 0;
+};
+
 struct AnalysisResult {
   llvm::DenseMap<const llvm::Value *, unsigned> ValueToComponent;
   llvm::SmallVector<Component, 8> Components;
   llvm::SmallVector<ComponentEdge, 16> Edges;
   llvm::SmallVector<CompareAffinity, 8> CompareAffinities;
+  llvm::SmallVector<AnchorPressure, 8> AnchorPressures;
+  llvm::SmallVector<ExtensionPressure, 8> ExtensionPressures;
 };
 
 struct PlanResult {
