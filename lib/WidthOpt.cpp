@@ -673,10 +673,10 @@ bool tryShrinkPhiOfExts(PHINode &Phi) {
         Info.Kind = Ext->Kind;
         Info.NarrowWidth = Ext->NarrowWidth;
         Info.WideWidth = Ext->WideWidth;
-      } else if (Info.Kind != Ext->Kind || Info.NarrowWidth != Ext->NarrowWidth ||
-                 Info.WideWidth != Ext->WideWidth) {
+      } else if (Info.Kind != Ext->Kind || Info.WideWidth != Ext->WideWidth) {
         return false;
       }
+      Info.NarrowWidth = std::max(Info.NarrowWidth, Ext->NarrowWidth);
       continue;
     }
 
@@ -692,7 +692,12 @@ bool tryShrinkPhiOfExts(PHINode &Phi) {
     IncomingBlocks.push_back(Phi.getIncomingBlock(I));
 
     if (auto Ext = getExtOperandInfo(Incoming)) {
-      NarrowIncomingValues.push_back(Ext->NarrowValue);
+      Value *NarrowIncoming = Ext->NarrowValue;
+      if (Info.NarrowWidth != Ext->NarrowWidth) {
+        IRBuilder<> B(IncomingBlocks.back()->getTerminator());
+        NarrowIncoming = materializeAtWidth(B, *Ext, Info.NarrowWidth);
+      }
+      NarrowIncomingValues.push_back(NarrowIncoming);
       Info.Producers.push_back(Ext->Producer);
       continue;
     }
@@ -751,22 +756,16 @@ bool tryShrinkSelectOfExts(SelectInst &Sel) {
     return false;
 
   PhiShrinkInfo Info;
-  if (TrueExt) {
-    Info.Kind = TrueExt->Kind;
-    Info.NarrowWidth = TrueExt->NarrowWidth;
-    Info.WideWidth = TrueExt->WideWidth;
-  } else {
-    Info.Kind = FalseExt->Kind;
-    Info.NarrowWidth = FalseExt->NarrowWidth;
-    Info.WideWidth = FalseExt->WideWidth;
-  }
+  const ExtOperandInfo &Seed = TrueExt ? *TrueExt : *FalseExt;
+  Info.Kind = Seed.Kind;
+  Info.NarrowWidth = Seed.NarrowWidth;
+  Info.WideWidth = Seed.WideWidth;
 
   if (Info.WideWidth != WideTy->getBitWidth())
     return false;
 
   auto validateExt = [&](const std::optional<ExtOperandInfo> &Ext) {
-    return Ext && Ext->Kind == Info.Kind && Ext->NarrowWidth == Info.NarrowWidth &&
-           Ext->WideWidth == Info.WideWidth;
+    return Ext && Ext->Kind == Info.Kind && Ext->WideWidth == Info.WideWidth;
   };
 
   if (TrueExt && !validateExt(TrueExt))
@@ -774,15 +773,15 @@ bool tryShrinkSelectOfExts(SelectInst &Sel) {
   if (FalseExt && !validateExt(FalseExt))
     return false;
 
+  if (TrueExt)
+    Info.NarrowWidth = std::max(Info.NarrowWidth, TrueExt->NarrowWidth);
+  if (FalseExt)
+    Info.NarrowWidth = std::max(Info.NarrowWidth, FalseExt->NarrowWidth);
+
   if (TrueC && !canRepresentConstant(*TrueC, Info.Kind, Info.NarrowWidth))
     return false;
   if (FalseC && !canRepresentConstant(*FalseC, Info.Kind, Info.NarrowWidth))
     return false;
-
-  Value *NarrowTV = TrueExt ? TrueExt->NarrowValue
-                            : convertConstantToNarrow(*TrueC, Info.NarrowWidth);
-  Value *NarrowFV = FalseExt ? FalseExt->NarrowValue
-                             : convertConstantToNarrow(*FalseC, Info.NarrowWidth);
 
   unsigned RemovableExts = 0;
   if (TrueExt && TrueExt->Producer->hasOneUse())
@@ -791,16 +790,30 @@ bool tryShrinkSelectOfExts(SelectInst &Sel) {
       FalseExt->Producer != (TrueExt ? TrueExt->Producer : nullptr))
     ++RemovableExts;
 
-  // Rebuilding the select at the narrow width always inserts one widening cast
-  // for the surviving wide uses. Only do that when at least one arm extension
-  // disappears so the rewrite does not increase instruction count.
-  if (RemovableExts == 0)
+  unsigned AddedExts = 1;
+  if (TrueExt && TrueExt->NarrowWidth != Info.NarrowWidth &&
+      !isa<Constant>(TrueExt->NarrowValue))
+    ++AddedExts;
+  if (FalseExt && FalseExt->NarrowWidth != Info.NarrowWidth &&
+      !isa<Constant>(FalseExt->NarrowValue))
+    ++AddedExts;
+
+  // Rebuilding the select at an intermediate width may also need to recreate
+  // some arm extensions below the original wide type. Only do that when the
+  // removable arm extensions pay for the new casts, so the rewrite does not
+  // increase instruction count.
+  if (AddedExts > RemovableExts)
     return false;
 
   IRBuilder<> B(&Sel);
-  auto *NarrowSel =
-      cast<SelectInst>(B.CreateSelect(Sel.getCondition(), NarrowTV, NarrowFV,
-                                      Sel.getName() + ".narrow"));
+  Value *NarrowTV = TrueExt ? materializeAtWidth(B, *TrueExt, Info.NarrowWidth)
+                            : convertConstantToNarrow(*TrueC, Info.NarrowWidth);
+  Value *NarrowFV =
+      FalseExt ? materializeAtWidth(B, *FalseExt, Info.NarrowWidth)
+               : convertConstantToNarrow(*FalseC, Info.NarrowWidth);
+  auto *NarrowSel = cast<SelectInst>(
+      B.CreateSelect(Sel.getCondition(), NarrowTV, NarrowFV,
+                     Sel.getName() + ".narrow"));
   Instruction *Wide = nullptr;
   if (Info.Kind == ExtKind::ZExt)
     Wide = cast<Instruction>(B.CreateZExt(NarrowSel, WideTy, Sel.getName()));

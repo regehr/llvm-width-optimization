@@ -49,8 +49,10 @@ currently comes from targeted local rewrites that complement the planner.
   - mixed `sext/zext` for signed predicates
   - mixed `sext/zext` for `eq/ne`
 - `icmp` + `select` to `llvm.smin/smax/umin/umax`
-- `phi` shrinking for `zext` or `sext` inputs plus fitting constants
-- `select` shrinking for `zext` or `sext` arms plus fitting constants
+- `phi` shrinking for `zext` or `sext` inputs plus fitting constants,
+  including mixed narrow widths through a common intermediate width
+- `select` shrinking for `zext` or `sext` arms plus fitting constants,
+  including mixed narrow widths through a common intermediate width
 - freeze-aware compare shrinking via `freeze(cast x) -> cast(freeze x)`
 - `sext` to `zext nneg` when `LazyValueInfo` proves the operand non-negative
 - demanded-bits-style `sext` to `zext nneg`
@@ -216,15 +218,6 @@ proof and regression discipline.
   `freeze`, `and`, `or`, and `xor`. That mismatch lets neighboring components
   optimize against width choices that never materialize, which directly weakens
   the final result.
-- relax `phi` and `select` shrinking so they can use a common intermediate
-  width instead of requiring all extension arms to have the exact same narrow
-  width
-  The implementation already has a helper that can materialize an extension
-  operand at any width between its narrow and wide forms, but the `phi` and
-  `select` matchers still require all extension arms to agree on one exact
-  narrow width. That leaves legal cases such as mixed `zext i8` and `zext i16`
-  arms feeding one wider `phi` or `select` untouched even though shrinking to
-  `i16` is already structurally supported.
 - improve the widened-component internal sign policy so one target-width
   `zext` user does not block elimination of many target-width `sext` users, or
   vice versa
