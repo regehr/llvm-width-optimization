@@ -1,0 +1,13 @@
+import sys
+import os
+
+config.llvm_tools_dir = "@WO_LLVM_INSTALL_DIR@/bin"
+config.llvm_shlib_ext = "@WO_TEST_SHLIBEXT@"
+config.llvm_shlib_dir = "@CMAKE_LIBRARY_OUTPUT_DIRECTORY@"
+
+import lit.llvm
+lit.llvm.initialize(lit_config, config)
+
+config.test_exec_root = os.path.join("@CMAKE_CURRENT_BINARY_DIR@")
+
+lit_config.load_config(config, "@WO_TEST_SRC_DIR@/lit.cfg.py")

@@ -1,0 +1,5 @@
+.DS_Store
+.pandoc-styling/
+build/
+cmake-build-*/
+width-minimization-design.html

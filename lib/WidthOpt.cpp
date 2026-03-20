@@ -1,0 +1,948 @@
+#include "WidthOpt.h"
+
+#include "llvm/ADT/ArrayRef.h"
+#include "llvm/ADT/DenseSet.h"
+#include "llvm/ADT/EquivalenceClasses.h"
+#include "llvm/ADT/SmallString.h"
+#include "llvm/Analysis/AssumptionCache.h"
+#include "llvm/Analysis/LazyValueInfo.h"
+#include "llvm/Analysis/SimplifyQuery.h"
+#include "llvm/Analysis/TargetLibraryInfo.h"
+#include "llvm/Analysis/ValueTracking.h"
+#include "llvm/IR/IRBuilder.h"
+#include "llvm/IR/Constants.h"
+#include "llvm/IR/Dominators.h"
+#include "llvm/IR/DerivedTypes.h"
+#include "llvm/IR/Function.h"
+#include "llvm/IR/InstIterator.h"
+#include "llvm/IR/Instructions.h"
+#include "llvm/IR/Intrinsics.h"
+#include "llvm/IR/PassManager.h"
+#include "llvm/Passes/PassBuilder.h"
+#include "llvm/Plugins/PassPlugin.h"
+#include "llvm/Support/FormatVariadic.h"
+#include "llvm/Support/raw_ostream.h"
+#include "llvm/Transforms/Utils/Local.h"
+#include <optional>
+
+using namespace llvm;
+
+namespace widthopt {
+
+AnalysisKey WidthComponentAnalysis::Key;
+
+namespace {
+
+enum class ExtKind {
+  None,
+  ZExt,
+  SExt,
+};
+
+enum class MinMaxKind {
+  None,
+  SMin,
+  SMax,
+  UMin,
+  UMax,
+};
+
+struct PhiShrinkInfo {
+  ExtKind Kind = ExtKind::None;
+  unsigned NarrowWidth = 0;
+  unsigned WideWidth = 0;
+  SmallVector<Instruction *, 8> Producers;
+};
+
+struct ExtOperandInfo {
+  Value *NarrowValue = nullptr;
+  Instruction *Producer = nullptr;
+  ExtKind Kind = ExtKind::None;
+  unsigned NarrowWidth = 0;
+  unsigned WideWidth = 0;
+};
+
+static IntegerType *getIntegerTy(Value *V) {
+  return dyn_cast<IntegerType>(V->getType());
+}
+
+static bool isIntegerValue(Value *V) {
+  return getIntegerTy(V) != nullptr;
+}
+
+static void unionIfInteger(EquivalenceClasses<const Value *> &EC, Value *A,
+                           Value *B) {
+  if (!isIntegerValue(A) || !isIntegerValue(B))
+    return;
+  EC.unionSets(A, B);
+}
+
+static bool hasFixedIntegerSignature(const CallBase &CB) {
+  if (CB.getCalledFunction() == nullptr)
+    return true;
+
+  if (CB.isInlineAsm())
+    return true;
+
+  const Function *Callee = CB.getCalledFunction();
+  if (Callee->isIntrinsic()) {
+    Intrinsic::ID ID = Callee->getIntrinsicID();
+    switch (ID) {
+    case Intrinsic::smax:
+    case Intrinsic::smin:
+    case Intrinsic::umax:
+    case Intrinsic::umin:
+      return false;
+    default:
+      return true;
+    }
+  }
+
+  return true;
+}
+
+static InstClass classifyInstruction(Instruction &I) {
+  if (!isIntegerValue(&I))
+    return InstClass::Ignore;
+
+  if (isa<PHINode>(I) || isa<FreezeInst>(I))
+    return InstClass::FreelyWidthPolymorphic;
+
+  if (auto *SI = dyn_cast<SelectInst>(&I)) {
+    if (isIntegerValue(SI->getTrueValue()) && isIntegerValue(SI->getFalseValue()))
+      return InstClass::FreelyWidthPolymorphic;
+    return InstClass::Ignore;
+  }
+
+  if (auto *BO = dyn_cast<BinaryOperator>(&I)) {
+    switch (BO->getOpcode()) {
+    case Instruction::And:
+    case Instruction::Or:
+    case Instruction::Xor:
+      return InstClass::FreelyWidthPolymorphic;
+    default:
+      return InstClass::HardAnchor;
+    }
+  }
+
+  if (auto *Cmp = dyn_cast<ICmpInst>(&I)) {
+    (void)Cmp;
+    return InstClass::ConditionallyRetargetable;
+  }
+
+  if (isa<ZExtInst>(I) || isa<SExtInst>(I) || isa<TruncInst>(I))
+    return InstClass::ConditionallyRetargetable;
+
+  if (isa<LoadInst>(I) || isa<AllocaInst>(I) || isa<AtomicRMWInst>(I) ||
+      isa<AtomicCmpXchgInst>(I))
+    return InstClass::HardAnchor;
+
+  if (isa<PtrToIntInst>(I) || isa<IntToPtrInst>(I))
+    return InstClass::HardAnchor;
+
+  if (auto *CB = dyn_cast<CallBase>(&I)) {
+    if (hasFixedIntegerSignature(*CB))
+      return InstClass::HardAnchor;
+    return InstClass::ConditionallyRetargetable;
+  }
+
+  return InstClass::HardAnchor;
+}
+
+static void addEqualWidthConstraints(Instruction &I,
+                                     EquivalenceClasses<const Value *> &EC) {
+  if (!isIntegerValue(&I))
+    return;
+
+  if (auto *Phi = dyn_cast<PHINode>(&I)) {
+    for (Value *Incoming : Phi->incoming_values())
+      unionIfInteger(EC, &I, Incoming);
+    return;
+  }
+
+  if (auto *Fr = dyn_cast<FreezeInst>(&I)) {
+    unionIfInteger(EC, &I, Fr->getOperand(0));
+    return;
+  }
+
+  if (auto *Sel = dyn_cast<SelectInst>(&I)) {
+    unionIfInteger(EC, &I, Sel->getTrueValue());
+    unionIfInteger(EC, &I, Sel->getFalseValue());
+    return;
+  }
+
+  if (auto *BO = dyn_cast<BinaryOperator>(&I)) {
+    unionIfInteger(EC, &I, BO->getOperand(0));
+    unionIfInteger(EC, &I, BO->getOperand(1));
+    return;
+  }
+}
+
+static bool isAnchorValue(const Value *V) {
+  if (auto *Arg = dyn_cast<Argument>(V))
+    return isa<IntegerType>(Arg->getType());
+  return false;
+}
+
+static bool shouldTrackValue(const Value *V) {
+  return isa<IntegerType>(V->getType()) &&
+         (isa<Instruction>(V) || isa<Argument>(V));
+}
+
+static unsigned getValueWidth(const Value *V) {
+  return cast<IntegerType>(V->getType())->getBitWidth();
+}
+
+static std::string formatValue(const Value *V) {
+  std::string S;
+  raw_string_ostream OS(S);
+  if (V->hasName())
+    OS << "%" << V->getName();
+  else
+    V->printAsOperand(OS, false);
+  return S;
+}
+
+static void addCandidateWidth(Component &C, unsigned W) {
+  if (W == 0)
+    return;
+  if (llvm::is_contained(C.CandidateWidths, W))
+    return;
+  C.CandidateWidths.push_back(W);
+}
+
+static std::optional<ExtOperandInfo> getExtOperandInfo(Value *V) {
+  if (auto *Z = dyn_cast<ZExtInst>(V)) {
+    return ExtOperandInfo{Z->getOperand(0), Z, ExtKind::ZExt,
+                          getValueWidth(Z->getOperand(0)), getValueWidth(Z)};
+  }
+
+  if (auto *S = dyn_cast<SExtInst>(V)) {
+    return ExtOperandInfo{S->getOperand(0), S, ExtKind::SExt,
+                          getValueWidth(S->getOperand(0)), getValueWidth(S)};
+  }
+
+  return std::nullopt;
+}
+
+static bool canRepresentConstant(ConstantInt &C, ExtKind Kind,
+                                 unsigned NarrowWidth) {
+  APInt Narrow = C.getValue().trunc(NarrowWidth);
+  switch (Kind) {
+  case ExtKind::ZExt:
+    return C.getValue() == Narrow.zext(C.getBitWidth());
+  case ExtKind::SExt:
+    return C.getValue() == Narrow.sext(C.getBitWidth());
+  case ExtKind::None:
+    return false;
+  }
+  llvm_unreachable("Unexpected extension kind");
+}
+
+static Constant *convertConstantToNarrow(ConstantInt &C, unsigned NarrowWidth) {
+  return ConstantInt::get(IntegerType::get(C.getContext(), NarrowWidth),
+                          C.getValue().trunc(NarrowWidth));
+}
+
+static bool areEquivalentValues(Value *A, Value *B) {
+  if (A == B)
+    return true;
+
+  auto EA = getExtOperandInfo(A);
+  auto EB = getExtOperandInfo(B);
+  if (!EA || !EB)
+    return false;
+
+  return EA->Kind == EB->Kind && EA->NarrowWidth == EB->NarrowWidth &&
+         EA->WideWidth == EB->WideWidth && EA->NarrowValue == EB->NarrowValue;
+}
+
+static bool isEqOrNe(ICmpInst::Predicate Pred) {
+  return Pred == ICmpInst::ICMP_EQ || Pred == ICmpInst::ICMP_NE;
+}
+
+static bool isUnsignedICmp(ICmpInst::Predicate Pred) {
+  return ICmpInst::isUnsigned(Pred);
+}
+
+static bool isSignedICmp(ICmpInst::Predicate Pred) {
+  return ICmpInst::isSigned(Pred);
+}
+
+static unsigned computeShrinkWidth(ICmpInst::Predicate Pred,
+                                   const ExtOperandInfo &LHS,
+                                   const ExtOperandInfo &RHS) {
+  if (LHS.WideWidth != RHS.WideWidth)
+    return 0;
+
+  if (LHS.Kind == ExtKind::ZExt && RHS.Kind == ExtKind::ZExt) {
+    if (isEqOrNe(Pred) || isUnsignedICmp(Pred))
+      return std::max(LHS.NarrowWidth, RHS.NarrowWidth);
+    return 0;
+  }
+
+  if (LHS.Kind == ExtKind::SExt && RHS.Kind == ExtKind::SExt) {
+    if (isEqOrNe(Pred) || isSignedICmp(Pred))
+      return std::max(LHS.NarrowWidth, RHS.NarrowWidth);
+    return 0;
+  }
+
+  if (!isSignedICmp(Pred))
+    return 0;
+
+  if (LHS.Kind == ExtKind::SExt && RHS.Kind == ExtKind::ZExt)
+    return std::max(LHS.NarrowWidth, RHS.NarrowWidth + 1);
+
+  if (LHS.Kind == ExtKind::ZExt && RHS.Kind == ExtKind::SExt)
+    return std::max(LHS.NarrowWidth + 1, RHS.NarrowWidth);
+
+  return 0;
+}
+
+static Value *materializeAtWidth(IRBuilder<> &B, const ExtOperandInfo &Info,
+                                 unsigned TargetWidth) {
+  assert(TargetWidth >= Info.NarrowWidth && "Cannot shrink below source width");
+
+  if (TargetWidth == Info.NarrowWidth)
+    return Info.NarrowValue;
+
+  Type *TargetTy = IntegerType::get(B.getContext(), TargetWidth);
+  if (Info.Kind == ExtKind::ZExt)
+    return B.CreateZExt(Info.NarrowValue, TargetTy);
+  if (Info.Kind == ExtKind::SExt)
+    return B.CreateSExt(Info.NarrowValue, TargetTy);
+
+  llvm_unreachable("Unexpected extension kind");
+}
+
+static bool tryShrinkICmp(ICmpInst &Cmp) {
+  auto LHSInfo = getExtOperandInfo(Cmp.getOperand(0));
+  auto RHSInfo = getExtOperandInfo(Cmp.getOperand(1));
+  if (!LHSInfo || !RHSInfo)
+    return false;
+
+  unsigned TargetWidth =
+      computeShrinkWidth(Cmp.getPredicate(), *LHSInfo, *RHSInfo);
+  if (TargetWidth == 0 || TargetWidth >= LHSInfo->WideWidth)
+    return false;
+
+  IRBuilder<> B(&Cmp);
+  Value *NewLHS = materializeAtWidth(B, *LHSInfo, TargetWidth);
+  Value *NewRHS = materializeAtWidth(B, *RHSInfo, TargetWidth);
+  auto *NewCmp =
+      cast<ICmpInst>(B.CreateICmp(Cmp.getPredicate(), NewLHS, NewRHS));
+
+  SmallVector<Instruction *, 2> DeadRoots;
+  if (LHSInfo->Producer != RHSInfo->Producer)
+    DeadRoots.push_back(LHSInfo->Producer);
+  DeadRoots.push_back(RHSInfo->Producer);
+
+  Cmp.replaceAllUsesWith(NewCmp);
+  Cmp.eraseFromParent();
+
+  for (Instruction *I : DeadRoots) {
+    if (I != nullptr && I->use_empty())
+      RecursivelyDeleteTriviallyDeadInstructions(I);
+  }
+
+  return true;
+}
+
+static bool areHighBitsKnownZero(Value *V, unsigned NarrowWidth,
+                                 const DataLayout &DL, AssumptionCache *AC,
+                                 DominatorTree *DT, const Instruction *CxtI) {
+  unsigned WideWidth = getValueWidth(V);
+  if (NarrowWidth >= WideWidth)
+    return true;
+
+  SimplifyQuery SQ(DL, DT, AC, CxtI);
+  KnownBits KB = computeKnownBits(V, SQ);
+  APInt HighBits = APInt::getHighBitsSet(WideWidth, WideWidth - NarrowWidth);
+  return (KB.Zero & HighBits) == HighBits;
+}
+
+static bool tryWidenTruncEqualityICmp(ICmpInst &Cmp, const DataLayout &DL,
+                                      AssumptionCache *AC,
+                                      DominatorTree *DT) {
+  if (!isEqOrNe(Cmp.getPredicate()))
+    return false;
+
+  auto *LHS = dyn_cast<TruncInst>(Cmp.getOperand(0));
+  auto *RHS = dyn_cast<TruncInst>(Cmp.getOperand(1));
+  if (!LHS || !RHS)
+    return false;
+
+  unsigned NarrowWidth = getValueWidth(LHS);
+  if (NarrowWidth != getValueWidth(RHS))
+    return false;
+
+  Value *WideLHS = LHS->getOperand(0);
+  Value *WideRHS = RHS->getOperand(0);
+  if (getValueWidth(WideLHS) != getValueWidth(WideRHS))
+    return false;
+
+  if (!areHighBitsKnownZero(WideLHS, NarrowWidth, DL, AC, DT, &Cmp) ||
+      !areHighBitsKnownZero(WideRHS, NarrowWidth, DL, AC, DT, &Cmp))
+    return false;
+
+  IRBuilder<> B(&Cmp);
+  auto *NewCmp =
+      cast<ICmpInst>(B.CreateICmp(Cmp.getPredicate(), WideLHS, WideRHS));
+  Cmp.replaceAllUsesWith(NewCmp);
+  Cmp.eraseFromParent();
+
+  if (LHS->use_empty())
+    RecursivelyDeleteTriviallyDeadInstructions(LHS);
+  if (RHS->use_empty())
+    RecursivelyDeleteTriviallyDeadInstructions(RHS);
+
+  return true;
+}
+
+static bool isRelationalLess(ICmpInst::Predicate Pred) {
+  return Pred == ICmpInst::ICMP_SLT || Pred == ICmpInst::ICMP_SLE ||
+         Pred == ICmpInst::ICMP_ULT || Pred == ICmpInst::ICMP_ULE;
+}
+
+static bool isRelationalGreater(ICmpInst::Predicate Pred) {
+  return Pred == ICmpInst::ICMP_SGT || Pred == ICmpInst::ICMP_SGE ||
+         Pred == ICmpInst::ICMP_UGT || Pred == ICmpInst::ICMP_UGE;
+}
+
+static MinMaxKind getMinMaxKind(ICmpInst::Predicate Pred, bool TrueIsLHS) {
+  if (isSignedICmp(Pred)) {
+    if (isRelationalLess(Pred))
+      return TrueIsLHS ? MinMaxKind::SMin : MinMaxKind::SMax;
+    if (isRelationalGreater(Pred))
+      return TrueIsLHS ? MinMaxKind::SMax : MinMaxKind::SMin;
+    return MinMaxKind::None;
+  }
+
+  if (isUnsignedICmp(Pred)) {
+    if (isRelationalLess(Pred))
+      return TrueIsLHS ? MinMaxKind::UMin : MinMaxKind::UMax;
+    if (isRelationalGreater(Pred))
+      return TrueIsLHS ? MinMaxKind::UMax : MinMaxKind::UMin;
+    return MinMaxKind::None;
+  }
+
+  return MinMaxKind::None;
+}
+
+static Intrinsic::ID getIntrinsicForMinMaxKind(MinMaxKind K) {
+  switch (K) {
+  case MinMaxKind::SMin:
+    return Intrinsic::smin;
+  case MinMaxKind::SMax:
+    return Intrinsic::smax;
+  case MinMaxKind::UMin:
+    return Intrinsic::umin;
+  case MinMaxKind::UMax:
+    return Intrinsic::umax;
+  case MinMaxKind::None:
+    break;
+  }
+  llvm_unreachable("Unexpected min/max kind");
+}
+
+static bool tryConvertSelectToMinMax(SelectInst &Sel) {
+  auto *Ty = dyn_cast<IntegerType>(Sel.getType());
+  if (!Ty)
+    return false;
+
+  auto *Cmp = dyn_cast<ICmpInst>(Sel.getCondition());
+  if (!Cmp)
+    return false;
+
+  Value *LHS = Cmp->getOperand(0);
+  Value *RHS = Cmp->getOperand(1);
+  Value *TV = Sel.getTrueValue();
+  Value *FV = Sel.getFalseValue();
+
+  if (TV->getType() != Sel.getType() || FV->getType() != Sel.getType())
+    return false;
+  if (LHS->getType() != Sel.getType() || RHS->getType() != Sel.getType())
+    return false;
+
+  bool TrueIsLHS = false;
+  bool Matched = false;
+  if (areEquivalentValues(TV, LHS) && areEquivalentValues(FV, RHS)) {
+    TrueIsLHS = true;
+    Matched = true;
+  } else if (areEquivalentValues(TV, RHS) && areEquivalentValues(FV, LHS)) {
+    TrueIsLHS = false;
+    Matched = true;
+  }
+
+  if (!Matched)
+    return false;
+
+  MinMaxKind K = getMinMaxKind(Cmp->getPredicate(), TrueIsLHS);
+  if (K == MinMaxKind::None)
+    return false;
+
+  IRBuilder<> B(&Sel);
+  Value *MinMax =
+      B.CreateBinaryIntrinsic(getIntrinsicForMinMaxKind(K), FV, TV);
+  Sel.replaceAllUsesWith(MinMax);
+  Sel.eraseFromParent();
+
+  if (Cmp->use_empty())
+    RecursivelyDeleteTriviallyDeadInstructions(Cmp);
+
+  return true;
+}
+
+static bool tryShrinkPhiOfExts(PHINode &Phi) {
+  auto *WideTy = dyn_cast<IntegerType>(Phi.getType());
+  if (!WideTy)
+    return false;
+
+  PhiShrinkInfo Info;
+  bool SawExt = false;
+
+  SmallVector<Value *, 8> NarrowIncomingValues;
+  SmallVector<BasicBlock *, 8> IncomingBlocks;
+  NarrowIncomingValues.reserve(Phi.getNumIncomingValues());
+  IncomingBlocks.reserve(Phi.getNumIncomingValues());
+
+  for (unsigned I = 0, E = Phi.getNumIncomingValues(); I != E; ++I) {
+    Value *Incoming = Phi.getIncomingValue(I);
+    IncomingBlocks.push_back(Phi.getIncomingBlock(I));
+
+    if (auto Ext = getExtOperandInfo(Incoming)) {
+      if (Ext->WideWidth != WideTy->getBitWidth())
+        return false;
+
+      if (!SawExt) {
+        SawExt = true;
+        Info.Kind = Ext->Kind;
+        Info.NarrowWidth = Ext->NarrowWidth;
+        Info.WideWidth = Ext->WideWidth;
+      } else if (Info.Kind != Ext->Kind || Info.NarrowWidth != Ext->NarrowWidth ||
+                 Info.WideWidth != Ext->WideWidth) {
+        return false;
+      }
+
+      NarrowIncomingValues.push_back(Ext->NarrowValue);
+      Info.Producers.push_back(Ext->Producer);
+      continue;
+    }
+
+    auto *CI = dyn_cast<ConstantInt>(Incoming);
+    if (!CI)
+      return false;
+
+    if (!SawExt)
+      return false;
+
+    if (!canRepresentConstant(*CI, Info.Kind, Info.NarrowWidth))
+      return false;
+
+    NarrowIncomingValues.push_back(convertConstantToNarrow(*CI, Info.NarrowWidth));
+  }
+
+  if (!SawExt)
+    return false;
+
+  auto *NarrowTy = IntegerType::get(Phi.getContext(), Info.NarrowWidth);
+  auto *NarrowPhi = PHINode::Create(NarrowTy, Phi.getNumIncomingValues(),
+                                    Phi.getName() + ".narrow",
+                                    Phi.getIterator());
+  for (unsigned I = 0, E = NarrowIncomingValues.size(); I != E; ++I)
+    NarrowPhi->addIncoming(NarrowIncomingValues[I], IncomingBlocks[I]);
+
+  Instruction *InsertPt = &*Phi.getParent()->getFirstInsertionPt();
+  IRBuilder<> B(InsertPt);
+  Instruction *Wide = nullptr;
+  if (Info.Kind == ExtKind::ZExt)
+    Wide = cast<Instruction>(B.CreateZExt(NarrowPhi, WideTy, Phi.getName()));
+  else
+    Wide = cast<Instruction>(B.CreateSExt(NarrowPhi, WideTy, Phi.getName()));
+
+  Phi.replaceAllUsesWith(Wide);
+  Phi.eraseFromParent();
+
+  for (Instruction *Producer : Info.Producers)
+    if (Producer != nullptr && Producer->use_empty())
+      RecursivelyDeleteTriviallyDeadInstructions(Producer);
+
+  return true;
+}
+
+static bool tryShrinkSelectOfExts(SelectInst &Sel) {
+  auto *WideTy = dyn_cast<IntegerType>(Sel.getType());
+  if (!WideTy)
+    return false;
+
+  Value *TV = Sel.getTrueValue();
+  Value *FV = Sel.getFalseValue();
+
+  auto TrueExt = getExtOperandInfo(TV);
+  auto FalseExt = getExtOperandInfo(FV);
+  auto *TrueC = dyn_cast<ConstantInt>(TV);
+  auto *FalseC = dyn_cast<ConstantInt>(FV);
+
+  if (!TrueExt && !FalseExt)
+    return false;
+  if ((TrueExt == std::nullopt && !TrueC) || (FalseExt == std::nullopt && !FalseC))
+    return false;
+
+  PhiShrinkInfo Info;
+  if (TrueExt) {
+    Info.Kind = TrueExt->Kind;
+    Info.NarrowWidth = TrueExt->NarrowWidth;
+    Info.WideWidth = TrueExt->WideWidth;
+  } else {
+    Info.Kind = FalseExt->Kind;
+    Info.NarrowWidth = FalseExt->NarrowWidth;
+    Info.WideWidth = FalseExt->WideWidth;
+  }
+
+  if (Info.WideWidth != WideTy->getBitWidth())
+    return false;
+
+  auto validateExt = [&](const std::optional<ExtOperandInfo> &Ext) {
+    return Ext && Ext->Kind == Info.Kind && Ext->NarrowWidth == Info.NarrowWidth &&
+           Ext->WideWidth == Info.WideWidth;
+  };
+
+  if (TrueExt && !validateExt(TrueExt))
+    return false;
+  if (FalseExt && !validateExt(FalseExt))
+    return false;
+
+  if (TrueC && !canRepresentConstant(*TrueC, Info.Kind, Info.NarrowWidth))
+    return false;
+  if (FalseC && !canRepresentConstant(*FalseC, Info.Kind, Info.NarrowWidth))
+    return false;
+
+  Value *NarrowTV = TrueExt ? TrueExt->NarrowValue
+                            : convertConstantToNarrow(*TrueC, Info.NarrowWidth);
+  Value *NarrowFV = FalseExt ? FalseExt->NarrowValue
+                             : convertConstantToNarrow(*FalseC, Info.NarrowWidth);
+
+  IRBuilder<> B(&Sel);
+  auto *NarrowSel =
+      cast<SelectInst>(B.CreateSelect(Sel.getCondition(), NarrowTV, NarrowFV,
+                                      Sel.getName() + ".narrow"));
+  Instruction *Wide = nullptr;
+  if (Info.Kind == ExtKind::ZExt)
+    Wide = cast<Instruction>(B.CreateZExt(NarrowSel, WideTy, Sel.getName()));
+  else
+    Wide = cast<Instruction>(B.CreateSExt(NarrowSel, WideTy, Sel.getName()));
+
+  Sel.replaceAllUsesWith(Wide);
+  Sel.eraseFromParent();
+
+  if (TrueExt && TrueExt->Producer->use_empty())
+    RecursivelyDeleteTriviallyDeadInstructions(TrueExt->Producer);
+  if (FalseExt && FalseExt->Producer->use_empty())
+    RecursivelyDeleteTriviallyDeadInstructions(FalseExt->Producer);
+
+  return true;
+}
+
+static bool tryConvertSExtToNonNegZExt(SExtInst &Ext, LazyValueInfo &LVI) {
+  const Use &Base = Ext.getOperandUse(0);
+  if (!LVI.getConstantRangeAtUse(Base, /*UndefAllowed=*/false).isAllNonNegative())
+    return false;
+
+  auto *ZExt = CastInst::CreateZExtOrBitCast(Base, Ext.getType(), "",
+                                             Ext.getIterator());
+  ZExt->takeName(&Ext);
+  ZExt->setDebugLoc(Ext.getDebugLoc());
+  ZExt->setNonNeg();
+  Ext.replaceAllUsesWith(ZExt);
+  Ext.eraseFromParent();
+  return true;
+}
+
+static void inferCandidatesFromInstruction(Instruction &I,
+                                           AnalysisResult &R) {
+  if (auto *Ext = dyn_cast<ZExtInst>(&I)) {
+    unsigned SrcW = getValueWidth(Ext->getOperand(0));
+    unsigned DstW = getValueWidth(Ext);
+    unsigned DstID = R.ValueToComponent.lookup(Ext);
+    unsigned SrcID = R.ValueToComponent.lookup(Ext->getOperand(0));
+    addCandidateWidth(R.Components[DstID], SrcW);
+    addCandidateWidth(R.Components[SrcID], DstW);
+    return;
+  }
+
+  if (auto *Ext = dyn_cast<SExtInst>(&I)) {
+    unsigned SrcW = getValueWidth(Ext->getOperand(0));
+    unsigned DstW = getValueWidth(Ext);
+    unsigned DstID = R.ValueToComponent.lookup(Ext);
+    unsigned SrcID = R.ValueToComponent.lookup(Ext->getOperand(0));
+    addCandidateWidth(R.Components[DstID], SrcW);
+    addCandidateWidth(R.Components[SrcID], DstW);
+    return;
+  }
+
+  if (auto *Tr = dyn_cast<TruncInst>(&I)) {
+    unsigned SrcW = getValueWidth(Tr->getOperand(0));
+    unsigned DstW = getValueWidth(Tr);
+    unsigned DstID = R.ValueToComponent.lookup(Tr);
+    unsigned SrcID = R.ValueToComponent.lookup(Tr->getOperand(0));
+    addCandidateWidth(R.Components[DstID], SrcW);
+    addCandidateWidth(R.Components[SrcID], DstW);
+    return;
+  }
+
+  if (auto *Phi = dyn_cast<PHINode>(&I)) {
+    unsigned ThisID = R.ValueToComponent.lookup(Phi);
+    for (Value *Incoming : Phi->incoming_values()) {
+      auto Ext = getExtOperandInfo(Incoming);
+      if (!Ext)
+        continue;
+      if (Ext->WideWidth != getValueWidth(Phi))
+        continue;
+      addCandidateWidth(R.Components[ThisID], Ext->NarrowWidth);
+    }
+    return;
+  }
+
+  if (auto *Sel = dyn_cast<SelectInst>(&I)) {
+    unsigned ThisID = R.ValueToComponent.lookup(Sel);
+    for (Value *Arm : {Sel->getTrueValue(), Sel->getFalseValue()}) {
+      auto Ext = getExtOperandInfo(Arm);
+      if (!Ext)
+        continue;
+      if (Ext->WideWidth != getValueWidth(Sel))
+        continue;
+      addCandidateWidth(R.Components[ThisID], Ext->NarrowWidth);
+    }
+    return;
+  }
+}
+
+} // namespace
+
+WidthComponentAnalysis::Result
+WidthComponentAnalysis::run(Function &F, FunctionAnalysisManager &) {
+  EquivalenceClasses<const Value *> EC;
+  DenseSet<const Value *> TrackedValues;
+  for (Argument &Arg : F.args()) {
+    if (!shouldTrackValue(&Arg))
+      continue;
+    EC.insert(&Arg);
+    TrackedValues.insert(&Arg);
+  }
+
+  for (Instruction &I : instructions(F)) {
+    if (!shouldTrackValue(&I))
+      continue;
+    EC.insert(&I);
+    TrackedValues.insert(&I);
+
+    if (classifyInstruction(I) == InstClass::FreelyWidthPolymorphic)
+      addEqualWidthConstraints(I, EC);
+  }
+
+  AnalysisResult R;
+  DenseMap<const Value *, unsigned> LeaderToID;
+
+  unsigned NextID = 0;
+  for (const Value *V : TrackedValues) {
+    const Value *Leader = EC.getLeaderValue(V);
+    auto It = LeaderToID.find(Leader);
+    if (It == LeaderToID.end()) {
+      unsigned ID = NextID++;
+      LeaderToID[Leader] = ID;
+      R.Components.push_back(Component());
+      R.Components.back().ID = ID;
+      R.Components.back().OrigWidth = getValueWidth(V);
+      addCandidateWidth(R.Components.back(), getValueWidth(V));
+      It = LeaderToID.find(Leader);
+    }
+
+    unsigned ID = It->second;
+    R.ValueToComponent[V] = ID;
+    Component &C = R.Components[ID];
+    C.OrigWidth = std::max(C.OrigWidth, getValueWidth(V));
+    C.Fixed |= isAnchorValue(V);
+    C.Values.push_back(const_cast<Value *>(V));
+    if (auto *I = dyn_cast<Instruction>(const_cast<Value *>(V))) {
+      C.Instructions.push_back(I);
+      if (classifyInstruction(*I) == InstClass::HardAnchor)
+        C.Fixed = true;
+    }
+  }
+
+  DenseSet<uint64_t> SeenEdges;
+  for (Instruction &I : instructions(F)) {
+    for (Value *Op : I.operands()) {
+      if (!shouldTrackValue(Op))
+        continue;
+      auto FromIt = R.ValueToComponent.find(Op);
+      auto ToIt = R.ValueToComponent.find(&I);
+      if (FromIt == R.ValueToComponent.end() || ToIt == R.ValueToComponent.end())
+        continue;
+      if (FromIt->second == ToIt->second)
+        continue;
+      uint64_t Key = (uint64_t(FromIt->second) << 32) | uint64_t(ToIt->second);
+      if (SeenEdges.insert(Key).second)
+        R.Edges.push_back(ComponentEdge{FromIt->second, ToIt->second});
+    }
+
+    inferCandidatesFromInstruction(I, R);
+  }
+
+  return R;
+}
+
+PreservedAnalyses WidthComponentPrinter::run(Function &F,
+                                             FunctionAnalysisManager &AM) {
+  const AnalysisResult &R = AM.getResult<WidthComponentAnalysis>(F);
+
+  OS << "Width components for function '" << F.getName() << "':\n";
+  for (const Component &C : R.Components) {
+    OS << formatv("  component {0}: width=i{1}, fixed={2}, values={3}\n", C.ID,
+                  C.OrigWidth, C.Fixed ? "true" : "false", C.Values.size());
+    for (Value *V : C.Values) {
+      OS << "    " << formatValue(V);
+      if (auto *I = dyn_cast<Instruction>(V)) {
+        OS << " [";
+        switch (classifyInstruction(*I)) {
+        case InstClass::HardAnchor:
+          OS << "anchor";
+          break;
+        case InstClass::FreelyWidthPolymorphic:
+          OS << "poly";
+          break;
+        case InstClass::ConditionallyRetargetable:
+          OS << "conditional";
+          break;
+        case InstClass::Ignore:
+          OS << "ignore";
+          break;
+        }
+        OS << "]";
+      } else {
+        OS << " [arg]";
+      }
+      OS << "\n";
+    }
+  }
+
+  return PreservedAnalyses::all();
+}
+
+PreservedAnalyses WidthCandidatePrinter::run(Function &F,
+                                             FunctionAnalysisManager &AM) {
+  const AnalysisResult &R = AM.getResult<WidthComponentAnalysis>(F);
+
+  OS << "Width candidates for function '" << F.getName() << "':\n";
+  for (const Component &C : R.Components) {
+    SmallVector<unsigned, 4> Widths = C.CandidateWidths;
+    llvm::sort(Widths);
+    OS << formatv("  component {0}: orig=i{1}, fixed={2}, candidates=",
+                  C.ID, C.OrigWidth, C.Fixed ? "true" : "false");
+    for (unsigned I = 0, E = Widths.size(); I != E; ++I) {
+      if (I)
+        OS << ",";
+      OS << "i" << Widths[I];
+    }
+    OS << "\n";
+  }
+
+  for (const ComponentEdge &E : R.Edges)
+    OS << formatv("  edge {0} -> {1}\n", E.From, E.To);
+
+  return PreservedAnalyses::all();
+}
+
+PreservedAnalyses WidthOptPass::run(Function &F, FunctionAnalysisManager &AM) {
+  (void)AM.getResult<WidthComponentAnalysis>(F);
+  LazyValueInfo &LVI = AM.getResult<LazyValueAnalysis>(F);
+  AssumptionCache &AC = AM.getResult<AssumptionAnalysis>(F);
+  DominatorTree &DT = AM.getResult<DominatorTreeAnalysis>(F);
+  const DataLayout &DL = F.getDataLayout();
+
+  SmallVector<ICmpInst *, 16> Worklist;
+  SmallVector<SelectInst *, 16> Selects;
+  SmallVector<PHINode *, 16> Phis;
+  SmallVector<SExtInst *, 16> SExts;
+  for (Instruction &I : instructions(F))
+    if (auto *Cmp = dyn_cast<ICmpInst>(&I))
+      Worklist.push_back(Cmp);
+    else if (auto *Sel = dyn_cast<SelectInst>(&I))
+      Selects.push_back(Sel);
+    else if (auto *Phi = dyn_cast<PHINode>(&I))
+      Phis.push_back(Phi);
+    else if (auto *SExt = dyn_cast<SExtInst>(&I))
+      SExts.push_back(SExt);
+
+  bool Changed = false;
+
+  for (SExtInst *SExt : SExts) {
+    if (SExt->getParent() == nullptr)
+      continue;
+    Changed |= tryConvertSExtToNonNegZExt(*SExt, LVI);
+  }
+
+  for (ICmpInst *Cmp : Worklist) {
+    if (Cmp->getParent() == nullptr)
+      continue;
+    if (tryWidenTruncEqualityICmp(*Cmp, DL, &AC, &DT)) {
+      Changed = true;
+      continue;
+    }
+    Changed |= tryShrinkICmp(*Cmp);
+  }
+
+  for (SelectInst *Sel : Selects) {
+    if (Sel->getParent() == nullptr)
+      continue;
+    if (tryConvertSelectToMinMax(*Sel)) {
+      Changed = true;
+      continue;
+    }
+    Changed |= tryShrinkSelectOfExts(*Sel);
+  }
+
+  for (PHINode *Phi : Phis) {
+    if (Phi->getParent() == nullptr)
+      continue;
+    Changed |= tryShrinkPhiOfExts(*Phi);
+  }
+
+  if (!Changed)
+    return PreservedAnalyses::all();
+  return PreservedAnalyses::none();
+}
+
+static PassPluginLibraryInfo getWidthOptPluginInfo() {
+  return {LLVM_PLUGIN_API_VERSION, "WidthOpt", LLVM_VERSION_STRING,
+          [](PassBuilder &PB) {
+            PB.registerAnalysisRegistrationCallback(
+                [](FunctionAnalysisManager &FAM) {
+                  FAM.registerPass([&] { return WidthComponentAnalysis(); });
+                });
+
+            PB.registerPipelineParsingCallback(
+                [](StringRef Name, FunctionPassManager &FPM,
+                   ArrayRef<PassBuilder::PipelineElement>) {
+                  if (Name == "width-opt") {
+                    FPM.addPass(WidthOptPass());
+                    return true;
+                  }
+                  if (Name == "print<width-components>") {
+                    FPM.addPass(WidthComponentPrinter(errs()));
+                    return true;
+                  }
+                  if (Name == "print<width-candidates>") {
+                    FPM.addPass(WidthCandidatePrinter(errs()));
+                    return true;
+                  }
+                  return false;
+                });
+          }};
+}
+
+extern "C" LLVM_ATTRIBUTE_WEAK PassPluginLibraryInfo llvmGetPassPluginInfo() {
+  return getWidthOptPluginInfo();
+}
+
+} // namespace widthopt

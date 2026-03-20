@@ -1,0 +1,81 @@
+#ifndef LLVM_WIDTH_OPTIMIZATION_WIDTHOPT_H
+#define LLVM_WIDTH_OPTIMIZATION_WIDTHOPT_H
+
+#include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/SmallVector.h"
+#include "llvm/IR/PassManager.h"
+
+namespace llvm {
+class Function;
+class Instruction;
+class IntegerType;
+class raw_ostream;
+class Value;
+} // namespace llvm
+
+namespace widthopt {
+
+enum class InstClass {
+  HardAnchor,
+  FreelyWidthPolymorphic,
+  ConditionallyRetargetable,
+  Ignore
+};
+
+struct Component {
+  unsigned ID = 0;
+  unsigned OrigWidth = 0;
+  bool Fixed = false;
+  llvm::SmallVector<unsigned, 4> CandidateWidths;
+  llvm::SmallVector<llvm::Instruction *, 8> Instructions;
+  llvm::SmallVector<llvm::Value *, 8> Values;
+};
+
+struct ComponentEdge {
+  unsigned From = 0;
+  unsigned To = 0;
+};
+
+struct AnalysisResult {
+  llvm::DenseMap<const llvm::Value *, unsigned> ValueToComponent;
+  llvm::SmallVector<Component, 8> Components;
+  llvm::SmallVector<ComponentEdge, 16> Edges;
+};
+
+class WidthComponentAnalysis
+    : public llvm::AnalysisInfoMixin<WidthComponentAnalysis> {
+public:
+  using Result = AnalysisResult;
+
+  Result run(llvm::Function &F, llvm::FunctionAnalysisManager &AM);
+
+  static llvm::AnalysisKey Key;
+};
+
+class WidthComponentPrinter : public llvm::PassInfoMixin<WidthComponentPrinter> {
+  llvm::raw_ostream &OS;
+
+public:
+  explicit WidthComponentPrinter(llvm::raw_ostream &OS) : OS(OS) {}
+  llvm::PreservedAnalyses run(llvm::Function &F,
+                              llvm::FunctionAnalysisManager &AM);
+};
+
+class WidthCandidatePrinter : public llvm::PassInfoMixin<WidthCandidatePrinter> {
+  llvm::raw_ostream &OS;
+
+public:
+  explicit WidthCandidatePrinter(llvm::raw_ostream &OS) : OS(OS) {}
+  llvm::PreservedAnalyses run(llvm::Function &F,
+                              llvm::FunctionAnalysisManager &AM);
+};
+
+class WidthOptPass : public llvm::PassInfoMixin<WidthOptPass> {
+public:
+  llvm::PreservedAnalyses run(llvm::Function &F,
+                              llvm::FunctionAnalysisManager &AM);
+};
+
+} // namespace widthopt
+
+#endif
