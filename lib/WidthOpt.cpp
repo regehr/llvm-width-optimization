@@ -729,18 +729,24 @@ static Constant *extendConstant(ConstantInt &C, ExtKind Kind,
 static Value *materializeValueAtWidth(Value *V, ExtKind Kind,
                                       unsigned TargetWidth,
                                       Instruction *InsertBefore) {
-  if (getValueWidth(V) == TargetWidth)
+  unsigned CurrentWidth = getValueWidth(V);
+  if (CurrentWidth == TargetWidth)
     return V;
 
   auto *TargetTy = IntegerType::get(V->getContext(), TargetWidth);
-  if (auto *C = dyn_cast<ConstantInt>(V))
+  if (auto *C = dyn_cast<ConstantInt>(V)) {
+    if (TargetWidth < CurrentWidth)
+      return ConstantInt::get(TargetTy, C->getValue().trunc(TargetWidth));
     return extendConstant(*C, Kind, TargetWidth);
+  }
   if (isa<UndefValue>(V))
     return UndefValue::get(TargetTy);
   if (isa<PoisonValue>(V))
     return PoisonValue::get(TargetTy);
 
   IRBuilder<> B(InsertBefore);
+  if (TargetWidth < CurrentWidth)
+    return B.CreateTrunc(V, TargetTy);
   switch (Kind) {
   case ExtKind::ZExt:
     return B.CreateZExt(V, TargetTy);
@@ -912,7 +918,7 @@ static AnalysisResult computeWidthComponents(Function &F) {
 }
 
 struct ExternalExtUser {
-  Instruction *Ext = nullptr;
+  Instruction *User = nullptr;
   Value *OldValue = nullptr;
 };
 
@@ -938,7 +944,7 @@ static bool tryWidenComponentFromPlan(const Component &C, const AnalysisResult &
       return false;
 
   ExtKind Kind = ExtKind::None;
-  SmallVector<ExternalExtUser, 8> ExtUsers;
+  SmallVector<ExternalExtUser, 8> ExternalUsers;
   for (Value *V : C.Values) {
     for (User *U : V->users()) {
       auto *UserI = dyn_cast<Instruction>(U);
@@ -947,29 +953,27 @@ static bool tryWidenComponentFromPlan(const Component &C, const AnalysisResult &
       if (ComponentValues.count(UserI))
         continue;
 
-      ExtKind UserKind = ExtKind::None;
       if (auto *Z = dyn_cast<ZExtInst>(UserI)) {
-        if (Z->getOperand(0) != V || getValueWidth(Z) != TargetWidth)
+        if (Z->getOperand(0) != V) 
           return false;
-        UserKind = ExtKind::ZExt;
+        if (Kind == ExtKind::None)
+          Kind = ExtKind::ZExt;
+        else if (Kind != ExtKind::ZExt)
+          return false;
       } else if (auto *S = dyn_cast<SExtInst>(UserI)) {
-        if (S->getOperand(0) != V || getValueWidth(S) != TargetWidth)
+        if (S->getOperand(0) != V)
           return false;
-        UserKind = ExtKind::SExt;
-      } else {
-        return false;
+        if (Kind == ExtKind::None)
+          Kind = ExtKind::SExt;
+        else if (Kind != ExtKind::SExt)
+          return false;
       }
 
-      if (Kind == ExtKind::None)
-        Kind = UserKind;
-      else if (Kind != UserKind)
-        return false;
-
-      ExtUsers.push_back(ExternalExtUser{UserI, V});
+      ExternalUsers.push_back(ExternalExtUser{UserI, V});
     }
   }
 
-  if (Kind == ExtKind::None || ExtUsers.empty())
+  if (Kind == ExtKind::None || ExternalUsers.empty())
     return false;
 
   auto *TargetTy = IntegerType::get(C.Instructions.front()->getContext(),
@@ -1068,12 +1072,44 @@ static bool tryWidenComponentFromPlan(const Component &C, const AnalysisResult &
       return false;
   }
 
-  for (const ExternalExtUser &EU : ExtUsers) {
+  for (const ExternalExtUser &EU : ExternalUsers) {
     Value *NewV = NewValues.lookup(EU.OldValue);
     if (!NewV)
       return false;
-    EU.Ext->replaceAllUsesWith(NewV);
-    EU.Ext->eraseFromParent();
+
+    if (auto *Z = dyn_cast<ZExtInst>(EU.User)) {
+      if (!Z->use_empty()) {
+        Value *Replacement =
+            materializeValueAtWidth(NewV, Kind, getValueWidth(Z), Z);
+        Z->replaceAllUsesWith(Replacement);
+      }
+      Z->eraseFromParent();
+      continue;
+    }
+
+    if (auto *S = dyn_cast<SExtInst>(EU.User)) {
+      if (!S->use_empty()) {
+        Value *Replacement =
+            materializeValueAtWidth(NewV, Kind, getValueWidth(S), S);
+        S->replaceAllUsesWith(Replacement);
+      }
+      S->eraseFromParent();
+      continue;
+    }
+
+    if (auto *T = dyn_cast<TruncInst>(EU.User)) {
+      if (!T->use_empty()) {
+        Value *Replacement =
+            materializeValueAtWidth(NewV, Kind, getValueWidth(T), T);
+        T->replaceAllUsesWith(Replacement);
+      }
+      T->eraseFromParent();
+      continue;
+    }
+
+    Value *Boundary =
+        materializeValueAtWidth(NewV, Kind, C.OrigWidth, EU.User);
+    EU.User->replaceUsesOfWith(EU.OldValue, Boundary);
   }
 
   for (Instruction *I : C.Instructions)
