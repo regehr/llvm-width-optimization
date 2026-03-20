@@ -53,9 +53,7 @@ Follow the rules below unless the user explicitly overrides them.
 
 - After implementation, run focused tests for the changed area first.
 - Then run the full lit suite for the patched build.
-- Run Alive2 when it is usable.
-- If Alive2 fails because of an `alive-tv` crash, distinguish tool failure from
-  pass failure before drawing conclusions.
+- Run Alive2 to check correctness of the transformation
 
 ## Alive2 Crash Handling
 
@@ -63,8 +61,6 @@ Follow the rules below unless the user explicitly overrides them.
   IR pair.
 - Store reduced reproducers under `repro/` rather than `test/`, so they do not
   get picked up by normal lit or corpus verification automatically.
-- After the user rebuilds Alive2, rerun the reduced repro to see whether the
-  crash still reproduces.
 
 ## Useful Commands
 
