@@ -432,6 +432,8 @@ bool tryWidenTruncEqualityICmp(ICmpInst &Cmp, const DataLayout &DL,
                                AssumptionCache *AC, DominatorTree *DT) {
   if (!isEqOrNe(Cmp.getPredicate()))
     return false;
+  if (!isIntegerValue(Cmp.getOperand(0)) || !isIntegerValue(Cmp.getOperand(1)))
+    return false;
 
   auto *LHS = dyn_cast<TruncInst>(Cmp.getOperand(0));
   auto *RHS = dyn_cast<TruncInst>(Cmp.getOperand(1));
