@@ -942,6 +942,50 @@ struct ExternalExtUser {
   Value *OldValue = nullptr;
 };
 
+bool canRetargetBoundaryCompare(ICmpInst::Predicate Pred, ExtKind InternalKind) {
+  if (isEqOrNe(Pred))
+    return InternalKind != ExtKind::None;
+  if (isUnsignedICmp(Pred))
+    return InternalKind == ExtKind::ZExt;
+  if (isSignedICmp(Pred))
+    return InternalKind == ExtKind::SExt;
+  return false;
+}
+
+bool tryRetargetExternalICmp(ICmpInst &Cmp, const DenseSet<const Value *> &ComponentValues,
+                             const DenseMap<Value *, Value *> &NewValues,
+                             ExtKind InternalKind, unsigned OrigWidth,
+                             unsigned TargetWidth) {
+  if (!canRetargetBoundaryCompare(Cmp.getPredicate(), InternalKind))
+    return false;
+
+  Value *NewOps[2] = {nullptr, nullptr};
+  for (unsigned Idx = 0; Idx != 2; ++Idx) {
+    Value *Op = Cmp.getOperand(Idx);
+    if (ComponentValues.count(Op)) {
+      NewOps[Idx] = NewValues.lookup(Op);
+      if (!NewOps[Idx])
+        return false;
+      continue;
+    }
+
+    if (!isIntegerValue(Op) || getValueWidth(Op) != OrigWidth)
+      return false;
+    NewOps[Idx] = materializeValueAtWidth(Op, InternalKind, TargetWidth, &Cmp);
+    if (!NewOps[Idx])
+      return false;
+  }
+
+  IRBuilder<> B(&Cmp);
+  auto *NewCmp =
+      cast<ICmpInst>(B.CreateICmp(Cmp.getPredicate(), NewOps[0], NewOps[1]));
+  NewCmp->setDebugLoc(Cmp.getDebugLoc());
+  NewCmp->takeName(&Cmp);
+  Cmp.replaceAllUsesWith(NewCmp);
+  Cmp.eraseFromParent();
+  return true;
+}
+
 bool isWidenablePolyInstruction(Instruction &I) {
   // These are the operations we currently know how to rebuild uniformly at a
   // larger width inside one component. Anything else stays outside the generic
@@ -1154,7 +1198,23 @@ bool tryWidenComponentFromPlan(const Component &C, const AnalysisResult &R,
   // Each outgoing edge gets its own reconstruction policy. Matching wide
   // extension users can disappear entirely; everything else is repaired from
   // the widened value through an explicit boundary cast.
+  DenseSet<Instruction *> RetargetedUsers;
+  DenseSet<Instruction *> SeenUsers;
   for (const ExternalExtUser &EU : ExternalUsers) {
+    if (!SeenUsers.insert(EU.User).second)
+      continue;
+    auto *Cmp = dyn_cast<ICmpInst>(EU.User);
+    if (!Cmp)
+      continue;
+    if (tryRetargetExternalICmp(*Cmp, ComponentValues, NewValues, InternalKind,
+                                C.OrigWidth, TargetWidth))
+      RetargetedUsers.insert(EU.User);
+  }
+
+  for (const ExternalExtUser &EU : ExternalUsers) {
+    if (RetargetedUsers.contains(EU.User))
+      continue;
+
     Value *NewV = NewValues.lookup(EU.OldValue);
     assert(NewV && "Every component value should have a widened replacement");
 
