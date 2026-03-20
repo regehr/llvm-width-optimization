@@ -72,8 +72,14 @@ bool isIntegerValue(Value *V) {
   return getIntegerTy(V) != nullptr;
 }
 
-void unionIfInteger(EquivalenceClasses<const Value *> &EC, Value *A, Value *B) {
+void unionIfRetargetable(EquivalenceClasses<const Value *> &EC, Value *A,
+                         Value *B) {
   if (!isIntegerValue(A) || !isIntegerValue(B))
+    return;
+  // Fixed argument widths are boundaries for the global search space. Keep
+  // them outside retargetable components so widening/narrowing decisions can
+  // insert casts at the boundary instead of freezing the whole component.
+  if (isa<Argument>(A) || isa<Argument>(B))
     return;
   EC.unionSets(A, B);
 }
@@ -162,24 +168,24 @@ void addEqualWidthConstraints(Instruction &I,
 
   if (auto *Phi = dyn_cast<PHINode>(&I)) {
     for (Value *Incoming : Phi->incoming_values())
-      unionIfInteger(EC, &I, Incoming);
+      unionIfRetargetable(EC, &I, Incoming);
     return;
   }
 
   if (auto *Fr = dyn_cast<FreezeInst>(&I)) {
-    unionIfInteger(EC, &I, Fr->getOperand(0));
+    unionIfRetargetable(EC, &I, Fr->getOperand(0));
     return;
   }
 
   if (auto *Sel = dyn_cast<SelectInst>(&I)) {
-    unionIfInteger(EC, &I, Sel->getTrueValue());
-    unionIfInteger(EC, &I, Sel->getFalseValue());
+    unionIfRetargetable(EC, &I, Sel->getTrueValue());
+    unionIfRetargetable(EC, &I, Sel->getFalseValue());
     return;
   }
 
   if (auto *BO = dyn_cast<BinaryOperator>(&I)) {
-    unionIfInteger(EC, &I, BO->getOperand(0));
-    unionIfInteger(EC, &I, BO->getOperand(1));
+    unionIfRetargetable(EC, &I, BO->getOperand(0));
+    unionIfRetargetable(EC, &I, BO->getOperand(1));
     return;
   }
 }
@@ -807,6 +813,114 @@ bool tryConvertWholeSExtToZExt(SExtInst &Ext) {
   Ext.replaceAllUsesWith(ZExt);
   Ext.eraseFromParent();
   return true;
+}
+
+unsigned getUnsignedRangeWidth(const Use &OperandUse, LazyValueInfo &LVI) {
+  ConstantRange CR = LVI.getConstantRangeAtUse(OperandUse, /*UndefAllowed=*/false);
+  if (CR.isFullSet())
+    return 0;
+
+  APInt UMax = CR.getUnsignedMax();
+  unsigned Bits = UMax.getActiveBits();
+  return std::max(1u, Bits);
+}
+
+bool tryNarrowUDivWithRange(BinaryOperator &BO, LazyValueInfo &LVI) {
+  if (BO.getOpcode() != Instruction::UDiv)
+    return false;
+
+  unsigned OrigWidth = getValueWidth(&BO);
+  unsigned LHSWidth = getUnsignedRangeWidth(BO.getOperandUse(0), LVI);
+  unsigned RHSWidth = getUnsignedRangeWidth(BO.getOperandUse(1), LVI);
+  if (LHSWidth == 0 || RHSWidth == 0)
+    return false;
+
+  unsigned TargetWidth = std::max(LHSWidth, RHSWidth);
+  if (TargetWidth >= OrigWidth)
+    return false;
+
+  IRBuilder<> B(&BO);
+  auto *TargetTy = IntegerType::get(BO.getContext(), TargetWidth);
+  Value *NarrowLHS = B.CreateTrunc(BO.getOperand(0), TargetTy);
+  Value *NarrowRHS = B.CreateTrunc(BO.getOperand(1), TargetTy);
+  auto *NarrowDiv = cast<Instruction>(
+      B.CreateUDiv(NarrowLHS, NarrowRHS, BO.getName() + ".narrow"));
+  NarrowDiv->setDebugLoc(BO.getDebugLoc());
+  auto *WideDiv = cast<Instruction>(B.CreateZExt(NarrowDiv, BO.getType(), BO.getName()));
+  WideDiv->setDebugLoc(BO.getDebugLoc());
+
+  BO.replaceAllUsesWith(WideDiv);
+  BO.eraseFromParent();
+  return true;
+}
+
+Value *findExistingZExtToWidth(Value *Src, unsigned TargetWidth) {
+  for (User *U : Src->users()) {
+    auto *Z = dyn_cast<ZExtInst>(U);
+    if (!Z)
+      continue;
+    if (getValueWidth(Z) == TargetWidth)
+      return Z;
+  }
+  return nullptr;
+}
+
+bool canWidenAddOperandWithoutOverflow(const ExtOperandInfo &ExtInfo,
+                                       ConstantInt &C) {
+  if (ExtInfo.Kind != ExtKind::ZExt)
+    return false;
+
+  unsigned MidWidth = ExtInfo.WideWidth;
+  APInt Max = APInt::getLowBitsSet(MidWidth, ExtInfo.NarrowWidth).zext(MidWidth);
+  APInt Sum = Max + C.getValue().zextOrTrunc(MidWidth);
+  return !Sum.ult(Max);
+}
+
+bool tryWidenAddThroughZExt(BinaryOperator &BO) {
+  if (BO.getOpcode() != Instruction::Add || !BO.hasOneUse())
+    return false;
+
+  auto *WideZ = dyn_cast<ZExtInst>(*BO.user_begin());
+  if (!WideZ)
+    return false;
+
+  unsigned WideWidth = getValueWidth(WideZ);
+  unsigned MidWidth = getValueWidth(&BO);
+  if (WideWidth <= MidWidth)
+    return false;
+  if (BO.hasNoUnsignedWrap() || BO.hasNoSignedWrap())
+    return false;
+
+  auto trySide = [&](unsigned ExtIdx, unsigned OtherIdx) -> bool {
+    auto ExtInfo = getExtOperandInfo(BO.getOperand(ExtIdx));
+    auto *C = dyn_cast<ConstantInt>(BO.getOperand(OtherIdx));
+    if (!ExtInfo || !C)
+      return false;
+    if (!canWidenAddOperandWithoutOverflow(*ExtInfo, *C))
+      return false;
+
+    Value *WideBase =
+        findExistingZExtToWidth(ExtInfo->NarrowValue, WideWidth);
+    IRBuilder<> B(WideZ);
+    if (!WideBase)
+      WideBase = B.CreateZExt(ExtInfo->NarrowValue,
+                              IntegerType::get(BO.getContext(), WideWidth));
+
+    Value *WideC =
+        ConstantInt::get(IntegerType::get(BO.getContext(), WideWidth),
+                         C->getValue().zextOrTrunc(WideWidth));
+    auto *WideAdd = cast<Instruction>(
+        B.CreateAdd(WideBase, WideC, BO.getName() + ".wide"));
+    WideAdd->setDebugLoc(BO.getDebugLoc());
+    WideZ->replaceAllUsesWith(WideAdd);
+    WideZ->eraseFromParent();
+
+    if (BO.use_empty())
+      RecursivelyDeleteTriviallyDeadInstructions(&BO);
+    return true;
+  };
+
+  return trySide(0, 1) || trySide(1, 0);
 }
 
 bool tryFoldZExtOfTruncToMask(ZExtInst &Ext) {
@@ -1844,7 +1958,9 @@ PreservedAnalyses WidthOptPass::run(Function &F, FunctionAnalysisManager &AM) {
   SmallVector<SelectInst *, 16> Selects;
   SmallVector<PHINode *, 16> Phis;
   SmallVector<SExtInst *, 16> SExts;
+  SmallVector<BinaryOperator *, 16> Adds;
   SmallVector<BinaryOperator *, 16> Ands;
+  SmallVector<BinaryOperator *, 16> UDivs;
   SmallVector<ZExtInst *, 16> ZExts;
   SmallVector<TruncInst *, 16> Truncs;
   SmallVector<FreezeInst *, 16> Freezes;
@@ -1856,10 +1972,13 @@ PreservedAnalyses WidthOptPass::run(Function &F, FunctionAnalysisManager &AM) {
     else if (auto *Phi = dyn_cast<PHINode>(&I))
       Phis.push_back(Phi);
     else if (auto *BO = dyn_cast<BinaryOperator>(&I)) {
-      if (BO->getOpcode() == Instruction::And)
+      if (BO->getOpcode() == Instruction::Add)
+        Adds.push_back(BO);
+      else if (BO->getOpcode() == Instruction::And)
         Ands.push_back(BO);
-    }
-    else if (auto *ZExt = dyn_cast<ZExtInst>(&I))
+      else if (BO->getOpcode() == Instruction::UDiv)
+        UDivs.push_back(BO);
+    } else if (auto *ZExt = dyn_cast<ZExtInst>(&I))
       ZExts.push_back(ZExt);
     else if (auto *SExt = dyn_cast<SExtInst>(&I))
       SExts.push_back(SExt);
@@ -1872,10 +1991,22 @@ PreservedAnalyses WidthOptPass::run(Function &F, FunctionAnalysisManager &AM) {
 
   // Run small local canonicalizations first. They simplify the IR, improve the
   // candidate-width graph, and expose cleaner regions for the global planner.
+  for (BinaryOperator *Add : Adds) {
+    if (Add->getParent() == nullptr)
+      continue;
+    Changed |= tryWidenAddThroughZExt(*Add);
+  }
+
   for (BinaryOperator *And : Ands) {
     if (And->getParent() == nullptr)
       continue;
     Changed |= tryFoldAndOfSExtToZExt(*And);
+  }
+
+  for (BinaryOperator *UDiv : UDivs) {
+    if (UDiv->getParent() == nullptr)
+      continue;
+    Changed |= tryNarrowUDivWithRange(*UDiv, LVI);
   }
 
   for (ZExtInst *ZExt : ZExts) {
