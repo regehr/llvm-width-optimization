@@ -294,6 +294,9 @@ unsigned computeShrinkWidth(ICmpInst::Predicate Pred, const ExtOperandInfo &LHS,
     return 0;
   }
 
+  if (isEqOrNe(Pred))
+    return std::max(LHS.NarrowWidth, RHS.NarrowWidth);
+
   if (!isSignedICmp(Pred))
     return 0;
 
@@ -404,6 +407,70 @@ bool tryWidenTruncEqualityICmp(ICmpInst &Cmp, const DataLayout &DL,
     RecursivelyDeleteTriviallyDeadInstructions(RHS);
 
   return true;
+}
+
+bool tryWidenTruncZeroExtendedICmp(ICmpInst &Cmp, const DataLayout &DL,
+                                   AssumptionCache *AC, DominatorTree *DT) {
+  if (!isEqOrNe(Cmp.getPredicate()) && !isUnsignedICmp(Cmp.getPredicate()))
+    return false;
+
+  auto tryOneDirection = [&](unsigned TruncIdx) -> bool {
+    auto *Tr = dyn_cast<TruncInst>(Cmp.getOperand(TruncIdx));
+    if (!Tr)
+      return false;
+
+    Value *Wide = Tr->getOperand(0);
+    unsigned NarrowWidth = getValueWidth(Tr);
+    unsigned WideWidth = getValueWidth(Wide);
+    if (NarrowWidth >= WideWidth)
+      return false;
+
+    Value *Other = Cmp.getOperand(1 - TruncIdx);
+    if (!isIntegerValue(Other) || getValueWidth(Other) != NarrowWidth)
+      return false;
+
+    if (!areHighBitsKnownZero(Wide, NarrowWidth, DL, AC, DT, &Cmp))
+      return false;
+
+    IRBuilder<> B(&Cmp);
+    Value *WideOther = Other;
+    if (WideWidth != NarrowWidth) {
+      if (auto OtherExt = getExtOperandInfo(Other)) {
+        if (OtherExt->Kind == ExtKind::ZExt &&
+            OtherExt->WideWidth == NarrowWidth) {
+          WideOther = materializeAtWidth(B, *OtherExt, WideWidth);
+        } else {
+          WideOther = B.CreateZExt(Other, IntegerType::get(Cmp.getContext(),
+                                                          WideWidth));
+        }
+      } else {
+        WideOther =
+            B.CreateZExt(Other, IntegerType::get(Cmp.getContext(), WideWidth));
+      }
+    }
+    assert(getValueWidth(WideOther) == WideWidth &&
+           "Widened compare operand should match source width");
+
+    Value *NewOps[2] = {Cmp.getOperand(0), Cmp.getOperand(1)};
+    NewOps[TruncIdx] = Wide;
+    NewOps[1 - TruncIdx] = WideOther;
+    auto *NewCmp =
+        cast<ICmpInst>(B.CreateICmp(Cmp.getPredicate(), NewOps[0], NewOps[1]));
+    NewCmp->setDebugLoc(Cmp.getDebugLoc());
+    NewCmp->takeName(&Cmp);
+    Cmp.replaceAllUsesWith(NewCmp);
+    Cmp.eraseFromParent();
+
+    if (Tr->use_empty())
+      RecursivelyDeleteTriviallyDeadInstructions(Tr);
+    if (auto *OtherI = dyn_cast<Instruction>(Other))
+      if (OtherI->use_empty())
+        RecursivelyDeleteTriviallyDeadInstructions(OtherI);
+
+    return true;
+  };
+
+  return tryOneDirection(0) || tryOneDirection(1);
 }
 
 bool isRelationalLess(ICmpInst::Predicate Pred) {
@@ -665,6 +732,37 @@ bool tryConvertSExtToNonNegZExt(SExtInst &Ext, LazyValueInfo &LVI) {
   return true;
 }
 
+bool tryFoldAndOfSExtToZExt(BinaryOperator &And) {
+  ConstantInt *Mask = dyn_cast<ConstantInt>(And.getOperand(0));
+  SExtInst *Ext = dyn_cast<SExtInst>(And.getOperand(1));
+  if (!Mask || !Ext) {
+    Mask = dyn_cast<ConstantInt>(And.getOperand(1));
+    Ext = dyn_cast<SExtInst>(And.getOperand(0));
+  }
+  if (!Mask || !Ext)
+    return false;
+
+  unsigned SrcWidth = getValueWidth(Ext->getOperand(0));
+  unsigned WideWidth = getValueWidth(Ext);
+  assert(Mask->getBitWidth() == WideWidth &&
+         "And mask should match operand width");
+
+  APInt DemandedMask = APInt::getLowBitsSet(WideWidth, SrcWidth);
+  if ((Mask->getValue() & ~DemandedMask) != 0)
+    return false;
+
+  IRBuilder<> B(&And);
+  auto *ZExt = CastInst::CreateZExtOrBitCast(Ext->getOperand(0), Ext->getType(),
+                                             "", Ext->getIterator());
+  ZExt->setDebugLoc(Ext->getDebugLoc());
+  ZExt->takeName(Ext);
+  ZExt->setNonNeg();
+  And.replaceUsesOfWith(Ext, ZExt);
+  if (Ext->use_empty())
+    Ext->eraseFromParent();
+  return true;
+}
+
 bool tryFoldZExtOfTruncToMask(ZExtInst &Ext) {
   auto *Tr = dyn_cast<TruncInst>(Ext.getOperand(0));
   if (!Tr)
@@ -705,6 +803,50 @@ bool tryFoldZExtOfTruncToMask(ZExtInst &Ext) {
 
   if (Tr->use_empty())
     RecursivelyDeleteTriviallyDeadInstructions(Tr);
+
+  return true;
+}
+
+bool tryShrinkTruncOfAdd(TruncInst &Tr) {
+  auto *BO = dyn_cast<BinaryOperator>(Tr.getOperand(0));
+  if (!BO || BO->getOpcode() != Instruction::Add || !BO->hasOneUse())
+    return false;
+
+  unsigned TargetWidth = getValueWidth(&Tr);
+  unsigned SourceWidth = getValueWidth(BO);
+  if (TargetWidth >= SourceWidth)
+    return false;
+
+  IRBuilder<> B(&Tr);
+  auto *TargetTy = IntegerType::get(Tr.getContext(), TargetWidth);
+  auto materializeOperand = [&](Value *V) -> Value * {
+    if (!isIntegerValue(V))
+      return nullptr;
+    unsigned W = getValueWidth(V);
+    if (W == TargetWidth)
+      return V;
+    if (auto Ext = getExtOperandInfo(V))
+      if (Ext->NarrowWidth == TargetWidth)
+        return Ext->NarrowValue;
+    if (auto *C = dyn_cast<ConstantInt>(V))
+      return ConstantInt::get(TargetTy, C->getValue().trunc(TargetWidth));
+    if (W > TargetWidth)
+      return B.CreateTrunc(V, TargetTy);
+    return B.CreateZExt(V, TargetTy);
+  };
+
+  Value *LHS = materializeOperand(BO->getOperand(0));
+  Value *RHS = materializeOperand(BO->getOperand(1));
+  if (!LHS || !RHS)
+    return false;
+
+  auto *NewAdd = cast<Instruction>(B.CreateAdd(LHS, RHS, Tr.getName()));
+  NewAdd->setDebugLoc(Tr.getDebugLoc());
+  Tr.replaceAllUsesWith(NewAdd);
+  Tr.eraseFromParent();
+
+  if (BO->use_empty())
+    RecursivelyDeleteTriviallyDeadInstructions(BO);
 
   return true;
 }
@@ -1496,7 +1638,9 @@ PreservedAnalyses WidthOptPass::run(Function &F, FunctionAnalysisManager &AM) {
   SmallVector<SelectInst *, 16> Selects;
   SmallVector<PHINode *, 16> Phis;
   SmallVector<SExtInst *, 16> SExts;
+  SmallVector<BinaryOperator *, 16> Ands;
   SmallVector<ZExtInst *, 16> ZExts;
+  SmallVector<TruncInst *, 16> Truncs;
   SmallVector<FreezeInst *, 16> Freezes;
   for (Instruction &I : instructions(F))
     if (auto *Cmp = dyn_cast<ICmpInst>(&I))
@@ -1505,10 +1649,16 @@ PreservedAnalyses WidthOptPass::run(Function &F, FunctionAnalysisManager &AM) {
       Selects.push_back(Sel);
     else if (auto *Phi = dyn_cast<PHINode>(&I))
       Phis.push_back(Phi);
+    else if (auto *BO = dyn_cast<BinaryOperator>(&I)) {
+      if (BO->getOpcode() == Instruction::And)
+        Ands.push_back(BO);
+    }
     else if (auto *ZExt = dyn_cast<ZExtInst>(&I))
       ZExts.push_back(ZExt);
     else if (auto *SExt = dyn_cast<SExtInst>(&I))
       SExts.push_back(SExt);
+    else if (auto *Tr = dyn_cast<TruncInst>(&I))
+      Truncs.push_back(Tr);
     else if (auto *FI = dyn_cast<FreezeInst>(&I))
       Freezes.push_back(FI);
 
@@ -1516,10 +1666,22 @@ PreservedAnalyses WidthOptPass::run(Function &F, FunctionAnalysisManager &AM) {
 
   // Run small local canonicalizations first. They simplify the IR, improve the
   // candidate-width graph, and expose cleaner regions for the global planner.
+  for (BinaryOperator *And : Ands) {
+    if (And->getParent() == nullptr)
+      continue;
+    Changed |= tryFoldAndOfSExtToZExt(*And);
+  }
+
   for (ZExtInst *ZExt : ZExts) {
     if (ZExt->getParent() == nullptr)
       continue;
     Changed |= tryFoldZExtOfTruncToMask(*ZExt);
+  }
+
+  for (TruncInst *Tr : Truncs) {
+    if (Tr->getParent() == nullptr)
+      continue;
+    Changed |= tryShrinkTruncOfAdd(*Tr);
   }
 
   for (SExtInst *SExt : SExts) {
@@ -1538,6 +1700,10 @@ PreservedAnalyses WidthOptPass::run(Function &F, FunctionAnalysisManager &AM) {
     if (Cmp->getParent() == nullptr)
       continue;
     if (tryWidenTruncEqualityICmp(*Cmp, DL, &AC, &DT)) {
+      Changed = true;
+      continue;
+    }
+    if (tryWidenTruncZeroExtendedICmp(*Cmp, DL, &AC, &DT)) {
       Changed = true;
       continue;
     }
