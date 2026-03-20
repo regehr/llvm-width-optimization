@@ -37,7 +37,9 @@ def optimize_file(opt_bin: Path, plugin: Path, src: Path, dst: Path) -> subproce
 
 
 def verify_file(alive_tv: Path, src: Path, tgt: Path) -> subprocess.CompletedProcess:
-    return run([str(alive_tv), str(src), str(tgt)])
+    return run(
+        [str(alive_tv), "--disable-undef-input", str(src), str(tgt)]
+    )
 
 
 def print_ir_pair(repo_root: Path, src: Path, tgt: Path) -> None:

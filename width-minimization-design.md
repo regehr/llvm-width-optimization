@@ -53,6 +53,8 @@ Implemented today:
 - per-edge boundary repair for widened components
 - planner-side compare affinities so `icmp` operands can pull component widths
   toward agreement
+- weighted planner pressure for repeated def-use boundaries and repeated
+  compare affinities between the same component pairs
 
 Current policy boundaries:
 
@@ -60,7 +62,7 @@ Current policy boundaries:
 - the generic widener currently supports only small width-polymorphic regions
 - many arithmetic improvements still come from targeted local rewrites rather
   than the global planner
-- implementation TODOs and test-promotion workflow live in `README.md`
+- implementation TODOs and current regression priorities live in `README.md`
 
 ## High-Level Strategy
 
@@ -755,8 +757,7 @@ The first code drop should aim to mirror the same broad shape:
 
 - `lib/` for pass implementation
 - `include/` for shared declarations if needed
-- `test/` for plugin regressions, with `tests/` reserved for future external
-  baseline cases
+- `test/` for plugin regressions
 - CMake wiring that builds a normal loadable pass plugin
 
 This is an engineering constraint rather than an algorithmic one, but it is

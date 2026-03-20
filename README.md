@@ -22,7 +22,7 @@ The repository currently contains:
 - a candidate-width analysis that infers alternative widths from ext/trunc use
   patterns
 - a first width-plan analysis that chooses per-component widths with a simple
-  graph-labeling heuristic
+  graph-labeling heuristic and weighted boundary pressure
 - planner-side compare affinities so `icmp` operands can influence width
   choice directly
 - a growing set of conservative local rewrites for compare, trunc-rooted, and
@@ -32,13 +32,12 @@ The repository currently contains:
 - a lit regression suite that now covers all former baseline corpus cases
 - an Alive2 validation script, including a `--verbose` mode that prints source
   and optimized IR
-- a historical `tests/` harness kept around for future baseline cases
 
 The current optimizer is still conservative, but it is no longer purely local.
 The global plan now drives widening of small width-polymorphic components and
-uses compare affinities to influence width choices. At the same time, a large
-fraction of the implemented behavior currently comes from targeted local
-rewrites that complement the planner.
+uses compare affinities plus weighted repeated boundary pressure to influence
+width choices. At the same time, a large fraction of the implemented behavior
+currently comes from targeted local rewrites that complement the planner.
 
 ## Implemented Local Rewrites
 
@@ -83,18 +82,11 @@ search space.
 
 - `include/`, `lib/`: plugin source
 - `test/`: lit regression tests for this plugin
-- `tests/`: historical baseline harness and documentation for future corpus use
 - `scripts/verify_with_alive2.py`: optimize each `.ll` test with `width-opt`
   and check correctness with Alive2
 - `width-minimization-design.md`: design document
 
-The two test directories have different roles:
-
-- `test/` tracks behavior that this plugin implements
-- `tests/` is reserved for future baseline/corpus cases; at the moment it does
-  not contain any `.ll` files
-
-The original external corpus has been fully promoted into `test/`.
+All maintained regression cases now live under `test/`.
 
 ## Building
 
@@ -156,17 +148,8 @@ cmake --build /Users/regehr/tmp/llvm-width-optimization-build --target check
 - the smoke sweep that runs `width-opt` over every `.ll` file under `test/`
   and reports crashes or hard failures
 
-Run the historical baseline harness after adding new external corpus files
-under `tests/`:
-
-```bash
-zsh /Users/regehr/llvm-width-optimization/tests/run-baseline.sh
-```
-
-At the moment, `tests/` contains no `.ll` files, so this harness is dormant.
-
-Run Alive2 over all `.ll` files under `test/` and any future `.ll` files under
-`tests/` after optimizing them with `width-opt`:
+Run Alive2 over all `.ll` files under `test/` after optimizing them with
+`width-opt`:
 
 ```bash
 python3 /Users/regehr/llvm-width-optimization/scripts/verify_with_alive2.py
@@ -222,12 +205,6 @@ proof and regression discipline.
 - fix the planner cost model so it counts all boundary pressure instead of
   collapsing each component pair to a single unit-cost edge or compare
   affinity
-  The current planner deduplicates ordinary def-use edges and compare
-  affinities down to one entry per component pair, then charges each mismatch
-  as cost 1. If one component feeds several width-changing users in the same
-  neighboring component, or several compares tie the same pair together, the
-  plan still sees only one unit of pressure. This systematically understates
-  the benefit of agreeing widths across heavily used boundaries.
 - align planner-side movable components with what the executor can actually
   rebuild
   Today the analysis and planner can choose widths for components containing
@@ -296,6 +273,6 @@ proof and regression discipline.
   helpers
 - add more direct profitability modeling so local widen/narrow decisions align
   better with the global objective
-- add new external baseline cases under `tests/` as fresh gaps are discovered,
-  and keep promoting them into `test/` once supported
+- add fresh regression cases under `test/` as new optimizer gaps are
+  discovered
 - make everything work for vector instructions
