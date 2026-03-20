@@ -994,6 +994,69 @@ bool tryShrinkTruncOfSelect(TruncInst &Tr) {
   return true;
 }
 
+bool tryShrinkTruncOfShiftRecurrence(TruncInst &Tr) {
+  auto *Shl = dyn_cast<BinaryOperator>(Tr.getOperand(0));
+  if (!Shl || Shl->getOpcode() != Instruction::Shl)
+    return false;
+
+  auto *Phi = dyn_cast<PHINode>(Shl->getOperand(0));
+  auto *AmtC = dyn_cast<ConstantInt>(Shl->getOperand(1));
+  if (!Phi || !AmtC || Phi->getParent() != Shl->getParent())
+    return false;
+  if (Phi->getNumIncomingValues() != 2)
+    return false;
+
+  BasicBlock *LoopBB = Phi->getParent();
+  int BackedgeIdx = -1;
+  int InitIdx = -1;
+  for (unsigned I = 0; I != 2; ++I) {
+    if (Phi->getIncomingBlock(I) == LoopBB)
+      BackedgeIdx = I;
+    else
+      InitIdx = I;
+  }
+  if (BackedgeIdx < 0 || InitIdx < 0)
+    return false;
+  if (Phi->getIncomingValue(BackedgeIdx) != Shl)
+    return false;
+
+  // Keep this first loop rewrite narrow and explicit: one self-recurrence with
+  // a constant shift amount, rooted at a final truncation.
+  if (!Phi->hasOneUse())
+    return false;
+
+  unsigned TargetWidth = getValueWidth(&Tr);
+  unsigned SourceWidth = getValueWidth(Shl);
+  if (TargetWidth >= SourceWidth)
+    return false;
+
+  BasicBlock *InitBB = Phi->getIncomingBlock(InitIdx);
+  Value *Init = Phi->getIncomingValue(InitIdx);
+  Value *NarrowInit =
+      materializeTruncRootedValueAtWidth(Init, TargetWidth,
+                                         InitBB->getTerminator());
+  if (!NarrowInit)
+    return false;
+
+  auto *TargetTy = IntegerType::get(Tr.getContext(), TargetWidth);
+  Constant *NarrowAmt = ConstantInt::get(TargetTy, AmtC->getValue().trunc(TargetWidth));
+
+  auto *NarrowPhi = PHINode::Create(TargetTy, 2, Phi->getName() + ".narrow",
+                                    Phi->getIterator());
+  NarrowPhi->setDebugLoc(Phi->getDebugLoc());
+  NarrowPhi->addIncoming(NarrowInit, InitBB);
+
+  IRBuilder<> B(Shl);
+  auto *NarrowShl =
+      cast<Instruction>(B.CreateShl(NarrowPhi, NarrowAmt, Shl->getName() + ".narrow"));
+  NarrowShl->setDebugLoc(Shl->getDebugLoc());
+  NarrowPhi->addIncoming(NarrowShl, LoopBB);
+
+  Tr.replaceAllUsesWith(NarrowShl);
+  Tr.eraseFromParent();
+  return true;
+}
+
 bool tryPushFreezeThroughExt(FreezeInst &FI) {
   // Canonicalize freeze(ext x) into ext(freeze x) for simple integer casts.
   // This follows the safe direction used by InstCombine: the cast only
@@ -1824,6 +1887,10 @@ PreservedAnalyses WidthOptPass::run(Function &F, FunctionAnalysisManager &AM) {
   for (TruncInst *Tr : Truncs) {
     if (Tr->getParent() == nullptr)
       continue;
+    if (tryShrinkTruncOfShiftRecurrence(*Tr)) {
+      Changed = true;
+      continue;
+    }
     if (tryShrinkTruncOfSelect(*Tr)) {
       Changed = true;
       continue;
