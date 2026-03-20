@@ -763,6 +763,19 @@ bool tryShrinkSelectOfExts(SelectInst &Sel) {
   Value *NarrowFV = FalseExt ? FalseExt->NarrowValue
                              : convertConstantToNarrow(*FalseC, Info.NarrowWidth);
 
+  unsigned RemovableExts = 0;
+  if (TrueExt && TrueExt->Producer->hasOneUse())
+    ++RemovableExts;
+  if (FalseExt && FalseExt->Producer->hasOneUse() &&
+      FalseExt->Producer != (TrueExt ? TrueExt->Producer : nullptr))
+    ++RemovableExts;
+
+  // Rebuilding the select at the narrow width always inserts one widening cast
+  // for the surviving wide uses. Only do that when at least one arm extension
+  // disappears so the rewrite does not increase instruction count.
+  if (RemovableExts == 0)
+    return false;
+
   IRBuilder<> B(&Sel);
   auto *NarrowSel =
       cast<SelectInst>(B.CreateSelect(Sel.getCondition(), NarrowTV, NarrowFV,
