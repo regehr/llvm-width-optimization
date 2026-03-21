@@ -627,6 +627,9 @@ unsigned getStructuralNarrowWidth(Value *V) {
   if (isa<ConstantInt>(V))
     return 0;
   if (auto *BO = dyn_cast<BinaryOperator>(V)) {
+    // lshr preserves zero-boundedness.
+    if (BO->getOpcode() == Instruction::LShr)
+      return getStructuralNarrowWidth(BO->getOperand(0));
     if (BO->getOpcode() == Instruction::And) {
       unsigned W0 = getStructuralNarrowWidth(BO->getOperand(0));
       unsigned W1 = getStructuralNarrowWidth(BO->getOperand(1));
@@ -1623,15 +1626,19 @@ bool tryFoldTruncOfExt(TruncInst &Tr) {
 
 // Returns true if V is provably zero in all bit positions >= Width.
 // This is a conservative structural check: it covers direct zero-extensions,
-// bitwise operations (and/or/xor) of zero-bounded operands, and constant
-// integers whose value fits in Width bits unsigned.  It does not require
-// KnownBits analysis.
+// bitwise operations (and/or/xor) of zero-bounded operands, lshr of a
+// zero-bounded value (lshr can only shift zeros in from the left), and
+// constant integers whose value fits in Width bits unsigned.  It does not
+// require KnownBits analysis.
 bool isZeroBoundedAtWidth(Value *V, unsigned Width) {
   if (auto Ext = getExtOperandInfo(V))
     return Ext->Kind == ExtKind::ZExt && Ext->NarrowWidth <= Width;
   if (auto *C = dyn_cast<ConstantInt>(V))
     return C->getValue().isIntN(Width);
   if (auto *BO = dyn_cast<BinaryOperator>(V)) {
+    // lshr shifts zeros in from the left, so zero-boundedness is preserved.
+    if (BO->getOpcode() == Instruction::LShr)
+      return isZeroBoundedAtWidth(BO->getOperand(0), Width);
     // and can only clear bits, so it is zero-bounded if either operand is.
     if (BO->getOpcode() == Instruction::And)
       return isZeroBoundedAtWidth(BO->getOperand(0), Width) ||
@@ -2075,22 +2082,26 @@ bool tryShrinkTruncOfShiftRecurrence(TruncInst &Tr) {
   return true;
 }
 
-bool tryShrinkTruncOfAddRecurrence(TruncInst &Tr) {
-  auto *Add = dyn_cast<BinaryOperator>(Tr.getOperand(0));
-  if (!Add || Add->getOpcode() != Instruction::Add)
+// Narrow a loop-carried recurrence  trunc(binop(phi, step))  to TargetWidth
+// when binop is low-bit-preserving (add, sub, mul, and, or, xor) and both the
+// phi's init value and the step can be materialized at TargetWidth.  The phi
+// must have exactly one use (the binop) so we can remove the wide versions.
+bool tryShrinkTruncOfLowBitsRecurrence(TruncInst &Tr) {
+  auto *BO = dyn_cast<BinaryOperator>(Tr.getOperand(0));
+  if (!BO || !isTruncRootedLowBitsPreservingOpcode(BO->getOpcode()))
     return false;
 
-  // One operand of the add must be the loop-carried phi; the other is the step.
+  // One operand of the binop must be the loop-carried phi.
   PHINode *Phi = nullptr;
-  Value *Step = nullptr;
-  for (int I = 0; I < 2; ++I) {
-    if (auto *P = dyn_cast<PHINode>(Add->getOperand(I))) {
+  unsigned PhiIdx = 0;
+  for (unsigned I = 0; I < 2; ++I) {
+    if (auto *P = dyn_cast<PHINode>(BO->getOperand(I))) {
       Phi = P;
-      Step = Add->getOperand(1 - I);
+      PhiIdx = I;
       break;
     }
   }
-  if (!Phi || Phi->getParent() != Add->getParent())
+  if (!Phi || Phi->getParent() != BO->getParent())
     return false;
   if (Phi->getNumIncomingValues() != 2)
     return false;
@@ -2106,29 +2117,29 @@ bool tryShrinkTruncOfAddRecurrence(TruncInst &Tr) {
   }
   if (BackedgeIdx < 0 || InitIdx < 0)
     return false;
-  if (Phi->getIncomingValue(BackedgeIdx) != Add)
+  if (Phi->getIncomingValue(BackedgeIdx) != BO)
     return false;
 
-  // Require the phi to have only one use (the add) so we can remove it.
+  // Require the phi to have only one use (the binop) so we can remove it.
   if (!Phi->hasOneUse())
     return false;
 
   unsigned TargetWidth = getValueWidth(&Tr);
-  unsigned SourceWidth = getValueWidth(Add);
+  unsigned SourceWidth = getValueWidth(BO);
   if (TargetWidth >= SourceWidth)
     return false;
 
   BasicBlock *InitBB = Phi->getIncomingBlock(InitIdx);
   Value *Init = Phi->getIncomingValue(InitIdx);
+  Value *Step = BO->getOperand(1 - PhiIdx);
 
-  // Both the initial value and the step must be materializable at TargetWidth.
   Value *NarrowInit = materializeTruncRootedValueAtWidth(
       Init, TargetWidth, InitBB->getTerminator());
   if (!NarrowInit)
     return false;
 
   Value *NarrowStep =
-      materializeTruncRootedValueAtWidth(Step, TargetWidth, Add);
+      materializeTruncRootedValueAtWidth(Step, TargetWidth, BO);
   if (!NarrowStep)
     return false;
 
@@ -2138,14 +2149,83 @@ bool tryShrinkTruncOfAddRecurrence(TruncInst &Tr) {
   NarrowPhi->setDebugLoc(Phi->getDebugLoc());
   NarrowPhi->addIncoming(NarrowInit, InitBB);
 
-  IRBuilder<> B(Add);
-  auto *NarrowAdd = cast<Instruction>(
-      B.CreateAdd(NarrowPhi, NarrowStep, Add->getName() + ".narrow"));
-  NarrowAdd->setDebugLoc(Add->getDebugLoc());
-  NarrowPhi->addIncoming(NarrowAdd, LoopBB);
+  IRBuilder<> B(BO);
+  Value *NarrowLHS = PhiIdx == 0 ? (Value *)NarrowPhi : NarrowStep;
+  Value *NarrowRHS = PhiIdx == 0 ? NarrowStep : (Value *)NarrowPhi;
+  auto *NarrowBO = cast<Instruction>(B.CreateBinOp(
+      (Instruction::BinaryOps)BO->getOpcode(), NarrowLHS, NarrowRHS,
+      BO->getName() + ".narrow"));
+  NarrowBO->setDebugLoc(BO->getDebugLoc());
+  NarrowPhi->addIncoming(NarrowBO, LoopBB);
 
-  Tr.replaceAllUsesWith(NarrowAdd);
+  Tr.replaceAllUsesWith(NarrowBO);
   Tr.eraseFromParent();
+  return true;
+}
+
+// Narrow  trunc(phi(v0, v1, ...))  when every incoming value is zero-bounded
+// at TargetWidth and materializable there.  This complements tryShrinkPhiOfExts
+// (which requires direct extensions) and handles cases where arms are bitwise
+// trees of zero-extensions or other zero-bounded expressions.
+bool tryShrinkTruncOfZeroBoundedPhi(TruncInst &Tr) {
+  auto *Phi = dyn_cast<PHINode>(Tr.getOperand(0));
+  if (!Phi || !Phi->hasOneUse())
+    return false;
+  if (!isIntegerValue(&Tr) || !isIntegerValue(Phi))
+    return false;
+
+  unsigned TargetWidth = getValueWidth(&Tr);
+  unsigned SourceWidth = getValueWidth(Phi);
+  if (TargetWidth >= SourceWidth)
+    return false;
+
+  // All incoming values must be zero-bounded at TargetWidth and materializable.
+  unsigned N = Phi->getNumIncomingValues();
+  for (unsigned I = 0; I != N; ++I) {
+    if (!isZeroBoundedAtWidth(Phi->getIncomingValue(I), TargetWidth))
+      return false;
+  }
+
+  // Cost check: use the trunc-rooted infrastructure on each arm.
+  SmallPtrSet<Value *, 16> AddedValues;
+  SmallPtrSet<Instruction *, 16> RemovedInstructions;
+  SmallPtrSet<Value *, 16> Visited;
+  for (unsigned I = 0; I != N; ++I) {
+    if (!collectTruncRootedValueCost(Phi->getIncomingValue(I), TargetWidth,
+                                     AddedValues, RemovedInstructions, Visited))
+      return false;
+  }
+  // The phi itself and the trunc are being replaced; require net non-increase.
+  unsigned RemovedCost = 1 + RemovedInstructions.size(); // 1 for the trunc
+  if (AddedValues.size() > RemovedCost)
+    return false;
+
+  // Materialize each incoming value at TargetWidth, inserting before the
+  // terminator of the incoming block.
+  auto *TargetTy = IntegerType::get(Phi->getContext(), TargetWidth);
+  auto *NarrowPhi = PHINode::Create(TargetTy, N, Phi->getName() + ".narrow",
+                                    Phi->getIterator());
+  NarrowPhi->setDebugLoc(Phi->getDebugLoc());
+
+  DenseMap<Value *, Value *> Cache;
+  for (unsigned I = 0; I != N; ++I) {
+    BasicBlock *BB = Phi->getIncomingBlock(I);
+    Value *NarrowVal = materializeTruncRootedValueAtWidth(
+        Phi->getIncomingValue(I), TargetWidth, BB->getTerminator(), &Cache);
+    if (!NarrowVal) {
+      // Bail out: remove the partially-built phi.
+      NarrowPhi->eraseFromParent();
+      return false;
+    }
+    NarrowPhi->addIncoming(NarrowVal, BB);
+  }
+
+  Tr.replaceAllUsesWith(NarrowPhi);
+  Tr.eraseFromParent();
+
+  if (Phi->use_empty())
+    RecursivelyDeleteTriviallyDeadInstructions(Phi);
+
   return true;
 }
 
@@ -2982,11 +3062,15 @@ bool runStructuralLocalRewritesToFixpoint(Function &F) {
         ChangedThisRound = true;
         continue;
       }
-      if (tryShrinkTruncOfAddRecurrence(*Tr)) {
+      if (tryShrinkTruncOfLowBitsRecurrence(*Tr)) {
         ChangedThisRound = true;
         continue;
       }
       if (tryShrinkTruncOfSelect(*Tr)) {
+        ChangedThisRound = true;
+        continue;
+      }
+      if (tryShrinkTruncOfZeroBoundedPhi(*Tr)) {
         ChangedThisRound = true;
         continue;
       }
