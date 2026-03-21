@@ -21,6 +21,7 @@ exit:
 }
 
 ; CHECK-LABEL: define void @f(
+; CHECK-NOT: sext
 ; CHECK: bb:
 ; CHECK: %ext.wide = zext nneg i32 %n to i64
 ; CHECK: call void @use64(i64 %ext.wide)

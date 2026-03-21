@@ -1,26 +1,13 @@
-set(WIDTH_OPT_PLUGINS
+add_library(WidthOpt SHARED WidthOpt.cpp)
+
+target_include_directories(WidthOpt
+  PRIVATE "${PROJECT_SOURCE_DIR}/include"
+  SYSTEM PRIVATE ${LLVM_INCLUDE_DIRS}
+)
+
+target_compile_definitions(WidthOpt PRIVATE ${LLVM_DEFINITIONS})
+
+target_link_libraries(
   WidthOpt
+  "$<$<PLATFORM_ID:Darwin>:-undefined dynamic_lookup>"
 )
-
-set(WidthOpt_SOURCES
-  WidthOpt.cpp
-)
-
-foreach(plugin ${WIDTH_OPT_PLUGINS})
-  add_library(
-    ${plugin}
-    SHARED
-    ${${plugin}_SOURCES}
-  )
-
-  target_include_directories(
-    ${plugin}
-    PRIVATE
-    "${CMAKE_CURRENT_SOURCE_DIR}/../include"
-  )
-
-  target_link_libraries(
-    ${plugin}
-    "$<$<PLATFORM_ID:Darwin>:-undefined dynamic_lookup>"
-  )
-endforeach()

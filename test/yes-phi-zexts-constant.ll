@@ -27,6 +27,7 @@ merge:
 }
 
 ; CHECK-LABEL: define i32 @f(
+; CHECK-NOT: phi i32
 ; CHECK: merge:
 ; CHECK: %[[PN:.*]] = phi i8 [ %a, %a.bb ], [ %b, %b.bb ], [ 42, %c ]
 ; CHECK: %[[W:.*]] = zext i8 %[[PN]] to i32

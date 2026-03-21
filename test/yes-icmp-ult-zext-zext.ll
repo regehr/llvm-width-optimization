@@ -11,6 +11,7 @@ define i1 @f(i8 %x, i16 %y) {
 }
 
 ; CHECK-LABEL: define i1 @f(
+; CHECK-NOT: i32
 ; CHECK: %[[X16:.*]] = zext i8 %x to i16
 ; CHECK: %[[C:.*]] = icmp ult i16 %[[X16]], %y
 ; CHECK: ret i1 %[[C]]

@@ -10,5 +10,7 @@ define i16 @f(i16 %x, i16 %y) {
 }
 
 ; CHECK-LABEL: define i16 @f(
+; CHECK-NOT: icmp
+; CHECK-NOT: select
 ; CHECK: %[[R:.*]] = call i16 @llvm.smax.i16(i16 %x, i16 %y)
 ; CHECK: ret i16 %[[R]]

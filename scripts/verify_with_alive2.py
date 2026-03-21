@@ -4,13 +4,14 @@ import argparse
 import subprocess
 import sys
 import tempfile
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 
 DEFAULT_OPT = Path("/Users/regehr/llvm-project/for-alive/bin/opt")
 DEFAULT_ALIVE_TV = Path("/Users/regehr/alive2-regehr/build/alive-tv")
-DEFAULT_PLUGIN = Path("/Users/regehr/tmp/llvm-width-optimization-build/lib/libWidthOpt.dylib")
+DEFAULT_PLUGIN = Path("/tmp/llvm-width-optimization-build-fixpoint/lib/libWidthOpt.dylib")
 NO_ALIVE_TAG = "no-alive"
 
 
@@ -148,34 +149,50 @@ def main() -> int:
 
     failures = 0
     skipped = 0
+
+    def process_test(test: Path, tmpdir: Path) -> Tuple[str, Path, Optional[subprocess.CompletedProcess], Optional[subprocess.CompletedProcess]]:
+        """Returns (status, test, opt_proc, alive_proc) where status is 'skip'/'pass'/'fail-opt'/'fail-alive'."""
+        if has_no_alive_tag(test):
+            return ("skip", test, None, None)
+        optimized = tmpdir / f"{test.stem}.opt.ll"
+        opt_proc = optimize_file(opt_bin, plugin, test, optimized)
+        if opt_proc.returncode != 0:
+            return ("fail-opt", test, opt_proc, None)
+        alive_proc = verify_file(alive_tv, test, optimized)
+        if alive_proc.returncode != 0:
+            return ("fail-alive", test, opt_proc, alive_proc)
+        return ("pass", test, opt_proc, alive_proc)
+
     with tempfile.TemporaryDirectory(prefix="width-opt-alive2-") as tmp:
         tmpdir = Path(tmp)
-        for test in tests:
-            if has_no_alive_tag(test):
-                print(f"SKIP {test.relative_to(repo_root)}: {NO_ALIVE_TAG}")
+        with ThreadPoolExecutor() as executor:
+            future_to_test = {executor.submit(process_test, t, tmpdir): t for t in tests}
+            results = []
+            for future in as_completed(future_to_test):
+                results.append(future.result())
+
+        # Sort results by test path for deterministic output; print inside tmpdir context
+        # so verbose mode can still read the optimized IR files.
+        results.sort(key=lambda r: r[1])
+
+        for status, test, opt_proc, alive_proc in results:
+            rel = test.relative_to(repo_root)
+            if status == "skip":
+                print(f"SKIP {rel}: {NO_ALIVE_TAG}")
                 skipped += 1
-                continue
-
-            optimized = tmpdir / f"{test.stem}.opt.ll"
-
-            opt_proc = optimize_file(opt_bin, plugin, test, optimized)
-            if opt_proc.returncode != 0:
+            elif status == "fail-opt":
                 print_failure("opt", test, opt_proc)
                 failures += 1
-                continue
-
-            alive_proc = verify_file(alive_tv, test, optimized)
-            if alive_proc.returncode != 0:
+            elif status == "fail-alive":
                 print_failure("alive-tv", test, alive_proc)
                 failures += 1
-                continue
-
-            if args.verbose:
-                print_ir_pair(repo_root, test, optimized)
-
-            summary = alive_proc.stdout.strip().splitlines()
-            tail = summary[-1] if summary else "ok"
-            print(f"PASS {test.relative_to(repo_root)}: {tail}")
+            else:
+                if args.verbose:
+                    optimized = tmpdir / f"{test.stem}.opt.ll"
+                    print_ir_pair(repo_root, test, optimized)
+                summary = alive_proc.stdout.strip().splitlines()
+                tail = summary[-1] if summary else "ok"
+                print(f"PASS {rel}: {tail}")
 
     if failures:
         print(f"\n{failures} file(s) failed", file=sys.stderr)

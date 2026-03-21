@@ -23,17 +23,15 @@ if(NOT ${WO_VALID_INSTALLATION})
     "Couldn't find LLVMConfig.cmake.")
 endif()
 
-list(APPEND CMAKE_PREFIX_PATH "${WO_LLVM_INSTALL_DIR}/lib/cmake/llvm/")
+list(APPEND CMAKE_PREFIX_PATH
+  "${WO_LLVM_INSTALL_DIR}/lib/cmake/llvm/"
+  "${WO_LLVM_INSTALL_DIR}/lib64/cmake/llvm/")
 
-find_package(LLVM CONFIG)
+find_package(LLVM REQUIRED CONFIG)
 find_package(Python3 REQUIRED COMPONENTS Interpreter)
 
 message(STATUS "Found LLVM ${LLVM_PACKAGE_VERSION}")
 message(STATUS "Using LLVMConfig.cmake in: ${WO_LLVM_INSTALL_DIR}")
-
-include_directories(SYSTEM ${LLVM_INCLUDE_DIRS})
-link_directories(${LLVM_LIBRARY_DIRS})
-add_definitions(${LLVM_DEFINITIONS})
 
 find_program(
   WO_LLVM_OPT
@@ -55,24 +53,24 @@ find_program(
   REQUIRED
 )
 
-set(CMAKE_CXX_STANDARD 17 CACHE STRING "")
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 if(NOT CMAKE_BUILD_TYPE)
   set(CMAKE_BUILD_TYPE Debug CACHE STRING "Build type (default Debug)" FORCE)
 endif()
 
-set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wall -fdiagnostics-color=always")
+add_compile_options(-Wall -fdiagnostics-color=always)
 
 if(NOT LLVM_ENABLE_RTTI)
-  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fno-rtti")
+  add_compile_options(-fno-rtti)
 endif()
 
 include(CheckCXXCompilerFlag)
 check_cxx_compiler_flag("-fvisibility-inlines-hidden"
   SUPPORTS_FVISIBILITY_INLINES_HIDDEN_FLAG)
-if(${SUPPORTS_FVISIBILITY_INLINES_HIDDEN_FLAG} EQUAL "1")
-  set(CMAKE_CXX_FLAGS
-    "${CMAKE_CXX_FLAGS} -fvisibility-inlines-hidden")
+if(SUPPORTS_FVISIBILITY_INLINES_HIDDEN_FLAG)
+  add_compile_options(-fvisibility-inlines-hidden)
 endif()
 
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}/bin")
