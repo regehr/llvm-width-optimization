@@ -1519,8 +1519,12 @@ bool isZeroBoundedAtWidth(Value *V, unsigned Width) {
   if (auto *C = dyn_cast<ConstantInt>(V))
     return C->getValue().isIntN(Width);
   if (auto *BO = dyn_cast<BinaryOperator>(V)) {
-    if (BO->getOpcode() == Instruction::And ||
-        BO->getOpcode() == Instruction::Or ||
+    // and can only clear bits, so it is zero-bounded if either operand is.
+    if (BO->getOpcode() == Instruction::And)
+      return isZeroBoundedAtWidth(BO->getOperand(0), Width) ||
+             isZeroBoundedAtWidth(BO->getOperand(1), Width);
+    // or and xor can set bits from either side, so both must be zero-bounded.
+    if (BO->getOpcode() == Instruction::Or ||
         BO->getOpcode() == Instruction::Xor)
       return isZeroBoundedAtWidth(BO->getOperand(0), Width) &&
              isZeroBoundedAtWidth(BO->getOperand(1), Width);
@@ -1954,6 +1958,80 @@ bool tryShrinkTruncOfShiftRecurrence(TruncInst &Tr) {
   NarrowPhi->addIncoming(NarrowShl, LoopBB);
 
   Tr.replaceAllUsesWith(NarrowShl);
+  Tr.eraseFromParent();
+  return true;
+}
+
+bool tryShrinkTruncOfAddRecurrence(TruncInst &Tr) {
+  auto *Add = dyn_cast<BinaryOperator>(Tr.getOperand(0));
+  if (!Add || Add->getOpcode() != Instruction::Add)
+    return false;
+
+  // One operand of the add must be the loop-carried phi; the other is the step.
+  PHINode *Phi = nullptr;
+  Value *Step = nullptr;
+  for (int I = 0; I < 2; ++I) {
+    if (auto *P = dyn_cast<PHINode>(Add->getOperand(I))) {
+      Phi = P;
+      Step = Add->getOperand(1 - I);
+      break;
+    }
+  }
+  if (!Phi || Phi->getParent() != Add->getParent())
+    return false;
+  if (Phi->getNumIncomingValues() != 2)
+    return false;
+
+  BasicBlock *LoopBB = Phi->getParent();
+  int BackedgeIdx = -1;
+  int InitIdx = -1;
+  for (unsigned I = 0; I != 2; ++I) {
+    if (Phi->getIncomingBlock(I) == LoopBB)
+      BackedgeIdx = I;
+    else
+      InitIdx = I;
+  }
+  if (BackedgeIdx < 0 || InitIdx < 0)
+    return false;
+  if (Phi->getIncomingValue(BackedgeIdx) != Add)
+    return false;
+
+  // Require the phi to have only one use (the add) so we can remove it.
+  if (!Phi->hasOneUse())
+    return false;
+
+  unsigned TargetWidth = getValueWidth(&Tr);
+  unsigned SourceWidth = getValueWidth(Add);
+  if (TargetWidth >= SourceWidth)
+    return false;
+
+  BasicBlock *InitBB = Phi->getIncomingBlock(InitIdx);
+  Value *Init = Phi->getIncomingValue(InitIdx);
+
+  // Both the initial value and the step must be materializable at TargetWidth.
+  Value *NarrowInit = materializeTruncRootedValueAtWidth(
+      Init, TargetWidth, InitBB->getTerminator());
+  if (!NarrowInit)
+    return false;
+
+  Value *NarrowStep =
+      materializeTruncRootedValueAtWidth(Step, TargetWidth, Add);
+  if (!NarrowStep)
+    return false;
+
+  auto *TargetTy = IntegerType::get(Tr.getContext(), TargetWidth);
+  auto *NarrowPhi = PHINode::Create(TargetTy, 2, Phi->getName() + ".narrow",
+                                    Phi->getIterator());
+  NarrowPhi->setDebugLoc(Phi->getDebugLoc());
+  NarrowPhi->addIncoming(NarrowInit, InitBB);
+
+  IRBuilder<> B(Add);
+  auto *NarrowAdd = cast<Instruction>(
+      B.CreateAdd(NarrowPhi, NarrowStep, Add->getName() + ".narrow"));
+  NarrowAdd->setDebugLoc(Add->getDebugLoc());
+  NarrowPhi->addIncoming(NarrowAdd, LoopBB);
+
+  Tr.replaceAllUsesWith(NarrowAdd);
   Tr.eraseFromParent();
   return true;
 }
@@ -2788,6 +2866,10 @@ bool runStructuralLocalRewritesToFixpoint(Function &F) {
         continue;
       }
       if (tryShrinkTruncOfShiftRecurrence(*Tr)) {
+        ChangedThisRound = true;
+        continue;
+      }
+      if (tryShrinkTruncOfAddRecurrence(*Tr)) {
         ChangedThisRound = true;
         continue;
       }

@@ -41,6 +41,23 @@ define i8 @lshr_of_and(i8 %a, i8 %b) {
 ; CHECK: %[[SHR:.*]] = lshr i8 %[[AND]], 2
 ; CHECK: ret i8 %[[SHR]]
 
+; and(x, mask) is zero-bounded when the mask fits in TargetWidth bits, even
+; if x is an unconstrained wide value.
+
+define i8 @lshr_of_and_mask(i32 %x) {
+  %masked = and i32 %x, 255
+  %shr = lshr i32 %masked, 3
+  %result = trunc i32 %shr to i8
+  ret i8 %result
+}
+
+; CHECK-LABEL: define i8 @lshr_of_and_mask(
+; CHECK-NOT: lshr i32
+; CHECK-NOT: and i32
+; CHECK: trunc i32 %x to i8
+; CHECK: lshr i8
+; CHECK: ret i8
+
 ; Nested: lshr(xor(or(zext(a), zext(b)), zext(c)), k).
 
 define i8 @lshr_of_nested_bitwise(i8 %a, i8 %b, i8 %c) {
