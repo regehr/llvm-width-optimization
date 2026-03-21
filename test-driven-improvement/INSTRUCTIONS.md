@@ -16,8 +16,8 @@ automating.
       
 ## Procedure
     
-There's a list of files here: `/tmp/list.txt`. Read the first line of
-this file, and locate the specified file in `/tmp/funcs1`. Move the
+There's a list of files here: `~/tmp/list.txt`. Read the first line of
+this file, and locate the specified file in `~/tmp/funcs1`. Move the
 file to a temporary location (don't copy it! we want to remove files
 so that we don't work on the same file twice) and also delete the
 first line from `list.txt`, so that the list stays up to date.
@@ -46,10 +46,10 @@ closely. Your goal is to think hard about it and try to remove any
 remaining width-changing instructions, but *without changing the
 meaning of the function*. You don't need to do this all by yourself,
 you can verify your changes using `alive-tv --disable-undef-input`
-which can be found at `/home/regehr/alive2-regehr/`. Since alive-tv is
-a very powerful refinement checker, I encourage you to be brave: you
-can try out different transformations even if you're not really sure
-that they're correct.
+which can be found at `/home/regehr/alive2-regehr/build`. Since
+alive-tv is a very powerful refinement checker, I encourage you to be
+brave: you can try out different transformations even if you're not
+really sure that they're correct.
 
 Changes you are allowed to make while optimizing the function include:
 1. Remove a width-changing instruction.
