@@ -71,8 +71,10 @@ Implemented today:
 - planner-side compare affinities so `icmp` operands can pull component widths
   toward agreement
 - weighted planner pressure for repeated def-use boundaries, fixed external
-  anchor uses, extension-kind mismatches at target width, compare-retarget sign
-  pressure, and repeated compare affinities between the same component pairs
+  anchor uses, extension-kind mismatches at target width including the extra
+  boundary reconstruction cost of opposite-kind ext users, compare-retarget
+  sign pressure, and repeated compare affinities between the same component
+  pairs
 
 Current policy boundaries:
 

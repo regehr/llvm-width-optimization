@@ -2032,6 +2032,21 @@ std::optional<ExtKind> getPreferredInternalKindForWidth(const AnalysisResult &R,
 bool canUnsignedCompareSelectSplitPressureBypass(ICmpInst &Cmp,
                                                  Value *ComponentOp);
 
+unsigned extensionMismatchPenalty(ExtKind InternalKind, ExtKind UserKind) {
+  if (InternalKind == UserKind)
+    return 0;
+
+  // `zext(trunc(x))` is repaired later as one low-bit mask, but
+  // `sext(trunc(zext(x)))` still needs both the boundary trunc and the
+  // surviving sign extension.
+  if (InternalKind == ExtKind::SExt && UserKind == ExtKind::ZExt)
+    return 1;
+  if (InternalKind == ExtKind::ZExt && UserKind == ExtKind::SExt)
+    return 2;
+
+  llvm_unreachable("Unexpected extension mismatch");
+}
+
 unsigned extensionMismatchCost(const AnalysisResult &R,
                                ArrayRef<unsigned> ChosenWidths,
                                unsigned ComponentID, unsigned Width) {
@@ -2046,8 +2061,7 @@ unsigned extensionMismatchCost(const AnalysisResult &R,
     if (ChosenWidths[E.User] != Width)
       continue;
     ExtKind UserKind = E.IsSExt ? ExtKind::SExt : ExtKind::ZExt;
-    if (*InternalKind != UserKind)
-      Cost += E.Weight;
+    Cost += E.Weight * extensionMismatchPenalty(*InternalKind, UserKind);
   }
   return Cost;
 }
@@ -2065,8 +2079,7 @@ unsigned totalExtensionMismatchCost(const AnalysisResult &R,
     if (!InternalKind)
       continue;
     ExtKind UserKind = E.IsSExt ? ExtKind::SExt : ExtKind::ZExt;
-    if (*InternalKind != UserKind)
-      Cost += E.Weight;
+    Cost += E.Weight * extensionMismatchPenalty(*InternalKind, UserKind);
   }
   return Cost;
 }

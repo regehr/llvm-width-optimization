@@ -29,8 +29,9 @@ The repository currently contains:
   patterns
 - a first width-plan analysis that chooses per-component widths with a simple
   graph-labeling heuristic with weighted boundary pressure, anchor pressure
-  from fixed external uses, extension-kind-aware mismatch penalties, and
-  compare-retarget sign pressure
+  from fixed external uses, extension-kind-aware mismatch penalties that
+  account for opposite-kind boundary reconstruction, and compare-retarget sign
+  pressure
 - planner-side compare affinities so `icmp` operands can influence width
   choice directly
 - a growing set of conservative local rewrites for compare, trunc-rooted, and
@@ -45,10 +46,11 @@ The repository currently contains:
 The current optimizer is still conservative, but it is no longer purely local.
 The global plan now drives widening of small width-polymorphic components and
 uses compare affinities plus weighted repeated boundary pressure, anchor
-pressure from fixed external uses, extension-kind-aware mismatch penalties,
-and compare-retarget sign pressure to influence width choices. At the same
-time, a large fraction of the implemented behavior currently comes from
-targeted local rewrites that complement the planner.
+pressure from fixed external uses, extension-kind-aware mismatch penalties
+that account for opposite-kind boundary reconstruction, and compare-retarget
+sign pressure to influence width choices. At the same time, a large fraction
+of the implemented behavior currently comes from targeted local rewrites that
+complement the planner.
 
 ## Implemented Local Rewrites
 
@@ -233,10 +235,12 @@ proof and regression discipline.
   instead of treating every width disagreement as the same unit-cost cut
   Repeated def-use boundaries, fixed external anchor uses, and target-width
   extension-kind mismatches are now modeled explicitly, and signed/unsigned
-  compare users now influence internal sign choice, but compare repair is still
-  priced too coarsely. The planner does not yet distinguish precisely between
-  direct compare retargeting, unsigned select-split repair, and boundaries that
-  require recreating casts per external use.
+  compare users now influence internal sign choice. Opposite-kind target-width
+  ext users are also priced as boundary cast plus surviving ext instead of as
+  a single surviving boundary. Compare repair is still priced too coarsely:
+  the planner does not yet distinguish precisely between direct compare
+  retargeting, unsigned select-split repair, and boundaries that require
+  recreating casts per external use.
 - generalize the global planner beyond the current simple heuristic and binary
   candidate model
 - broaden plan-driven rewrites to more instruction kinds than the current small
