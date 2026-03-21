@@ -73,9 +73,10 @@ Implemented today:
 - weighted planner pressure for repeated def-use boundaries, fixed external
   anchor uses, extension-kind mismatches at target width including the extra
   boundary reconstruction cost of opposite-kind ext users, compare-retarget
-  sign pressure, repeated compare affinities between the same component pairs,
-  and a small pairwise local-improvement step to escape simple two-component
-  local minima
+  sign pressure, mixed-sign equality-compare repair cost between widened
+  components, repeated compare affinities between the same component pairs, and
+  a small pairwise local-improvement step to escape simple two-component local
+  minima
 
 Current policy boundaries:
 

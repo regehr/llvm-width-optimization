@@ -2101,6 +2101,56 @@ unsigned compareRetargetMismatchCost(const AnalysisResult &R,
   return Cost;
 }
 
+unsigned equalityCompareRepairPairCost(const AnalysisResult &R,
+                                       ArrayRef<unsigned> ChosenWidths,
+                                       unsigned LHS, unsigned RHS) {
+  unsigned Width = ChosenWidths[LHS];
+  if (Width != ChosenWidths[RHS])
+    return 0;
+  if (Width <= R.Components[LHS].OrigWidth || Width <= R.Components[RHS].OrigWidth)
+    return 0;
+
+  auto LHSKind = getPreferredInternalKindForWidth(R, LHS, Width);
+  auto RHSKind = getPreferredInternalKindForWidth(R, RHS, Width);
+  if (!LHSKind || !RHSKind)
+    return 0;
+  return *LHSKind == *RHSKind ? 0u : 1u;
+}
+
+unsigned equalityCompareRepairMismatchCostForChoice(const AnalysisResult &R,
+                                                    ArrayRef<unsigned> ChosenWidths,
+                                                    unsigned ComponentID,
+                                                    unsigned Width) {
+  unsigned Cost = 0;
+  for (const EqualityCompareRepairPressure &P :
+       R.EqualityCompareRepairPressures) {
+    if (P.LHS != ComponentID && P.RHS != ComponentID)
+      continue;
+    unsigned Other = P.LHS == ComponentID ? P.RHS : P.LHS;
+    if (Width != ChosenWidths[Other])
+      continue;
+
+    SmallVector<unsigned, 8> TrialWidths(ChosenWidths.begin(), ChosenWidths.end());
+    TrialWidths[ComponentID] = Width;
+    Cost += P.Weight * equalityCompareRepairPairCost(R, TrialWidths, P.LHS,
+                                                     P.RHS);
+  }
+  return Cost;
+}
+
+unsigned totalEqualityCompareRepairMismatchCost(const AnalysisResult &R,
+                                                ArrayRef<unsigned> ChosenWidths) {
+  unsigned Cost = 0;
+  for (const EqualityCompareRepairPressure &P :
+       R.EqualityCompareRepairPressures) {
+    assert(P.LHS < ChosenWidths.size() && P.RHS < ChosenWidths.size() &&
+           "Equality compare repair pressures should reference valid component IDs");
+    Cost +=
+        P.Weight * equalityCompareRepairPairCost(R, ChosenWidths, P.LHS, P.RHS);
+  }
+  return Cost;
+}
+
 unsigned totalCompareRetargetMismatchCost(const AnalysisResult &R,
                                           ArrayRef<unsigned> ChosenWidths) {
   unsigned Cost = 0;
@@ -2141,6 +2191,8 @@ unsigned scoreWidthChoice(const AnalysisResult &R,
   }
   Score += extensionMismatchCost(R, ChosenWidths, ComponentID, Width);
   Score += compareRetargetMismatchCost(R, ComponentID, Width);
+  Score += equalityCompareRepairMismatchCostForChoice(R, ChosenWidths,
+                                                      ComponentID, Width);
   return Score;
 }
 
@@ -2198,6 +2250,7 @@ unsigned computePlanCost(const AnalysisResult &R,
   }
   TotalCost += totalExtensionMismatchCost(R, ChosenWidths);
   TotalCost += totalCompareRetargetMismatchCost(R, ChosenWidths);
+  TotalCost += totalEqualityCompareRepairMismatchCost(R, ChosenWidths);
   return TotalCost;
 }
 
@@ -2366,6 +2419,7 @@ AnalysisResult computeWidthComponents(Function &F) {
 
   DenseMap<uint64_t, unsigned> EdgeKeyToIndex;
   DenseMap<uint64_t, unsigned> AffinityKeyToIndex;
+  DenseMap<uint64_t, unsigned> EqualityRepairKeyToIndex;
   DenseMap<uint64_t, unsigned> AnchorKeyToIndex;
   DenseMap<uint64_t, unsigned> ExtKeyToIndex;
   DenseMap<uint64_t, unsigned> CompareRetargetKeyToIndex;
@@ -2443,6 +2497,16 @@ AnalysisResult computeWidthComponents(Function &F) {
           if (Inserted)
             R.CompareAffinities.push_back(CompareAffinity{A, B, 0});
           ++R.CompareAffinities[AffinityIt->second].Weight;
+
+          if (isEqOrNe(Cmp->getPredicate())) {
+            auto [RepairIt, RepairInserted] =
+                EqualityRepairKeyToIndex.try_emplace(
+                    Key, R.EqualityCompareRepairPressures.size());
+            if (RepairInserted)
+              R.EqualityCompareRepairPressures.push_back(
+                  EqualityCompareRepairPressure{A, B, 0});
+            ++R.EqualityCompareRepairPressures[RepairIt->second].Weight;
+          }
         }
       }
 
@@ -3235,6 +3299,10 @@ PreservedAnalyses WidthPlanPrinter::run(Function &F,
   for (const CompareAffinity &A : R.CompareAffinities)
     OS << formatv("  compare-affinity {0} <-> {1} weight={2}\n", A.LHS, A.RHS,
                   A.Weight);
+  for (const EqualityCompareRepairPressure &P :
+       R.EqualityCompareRepairPressures)
+    OS << formatv("  equality-compare-repair {0} <-> {1} weight={2}\n", P.LHS,
+                  P.RHS, P.Weight);
   for (const AnchorPressure &A : R.AnchorPressures)
     OS << formatv("  anchor-pressure component {0} -> i{1} weight={2}\n",
                   A.Component, A.Width, A.Weight);

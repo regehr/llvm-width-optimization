@@ -31,7 +31,8 @@ The repository currently contains:
   graph-labeling heuristic with single-node plus pairwise local-improvement
   steps, weighted boundary pressure, anchor pressure from fixed external uses,
   extension-kind-aware mismatch penalties that account for opposite-kind
-  boundary reconstruction, and compare-retarget sign pressure
+  boundary reconstruction, compare-retarget sign pressure, and mixed-kind
+  equality-compare repair cost between widened components
 - planner-side compare affinities so `icmp` operands can influence width
   choice directly
 - a growing set of conservative local rewrites for compare, trunc-rooted, and
@@ -48,9 +49,10 @@ The global plan now drives widening of small width-polymorphic components and
 uses compare affinities plus weighted repeated boundary pressure, anchor
 pressure from fixed external uses, extension-kind-aware mismatch penalties
 that account for opposite-kind boundary reconstruction, compare-retarget sign
-pressure, and a small pairwise-improvement escape hatch for two-component
-local minima to influence width choices. At the same time, a large fraction of
-the implemented behavior currently comes from targeted local rewrites that
+pressure, mixed-kind equality-compare repair cost between widened components,
+and a small pairwise-improvement escape hatch for two-component local minima
+to influence width choices. At the same time, a large fraction of the
+implemented behavior currently comes from targeted local rewrites that
 complement the planner.
 
 ## Implemented Local Rewrites
@@ -238,10 +240,12 @@ proof and regression discipline.
   extension-kind mismatches are now modeled explicitly, and signed/unsigned
   compare users now influence internal sign choice. Opposite-kind target-width
   ext users are also priced as boundary cast plus surviving ext instead of as
-  a single surviving boundary. Compare repair is still priced too coarsely:
-  the planner does not yet distinguish precisely between direct compare
-  retargeting, unsigned select-split repair, and boundaries that require
-  recreating casts per external use.
+  a single surviving boundary. Equality compares between widened components
+  with conflicting internal sign choices are also no longer treated as free
+  once widths agree. Compare repair is still priced too coarsely: the planner
+  does not yet distinguish precisely between direct compare retargeting,
+  unsigned select-split repair, and boundaries that require recreating casts
+  per external use.
 - generalize the global planner beyond the current simple heuristic and binary
   candidate model
   The planner now includes a pairwise local-improvement step to escape simple

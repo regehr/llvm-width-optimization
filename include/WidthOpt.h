@@ -43,6 +43,12 @@ struct CompareAffinity {
   unsigned Weight = 0;
 };
 
+struct EqualityCompareRepairPressure {
+  unsigned LHS = 0;
+  unsigned RHS = 0;
+  unsigned Weight = 0;
+};
+
 struct AnchorPressure {
   unsigned Component = 0;
   unsigned Width = 0;
@@ -68,6 +74,8 @@ struct AnalysisResult {
   llvm::SmallVector<Component, 8> Components;
   llvm::SmallVector<ComponentEdge, 16> Edges;
   llvm::SmallVector<CompareAffinity, 8> CompareAffinities;
+  llvm::SmallVector<EqualityCompareRepairPressure, 8>
+      EqualityCompareRepairPressures;
   llvm::SmallVector<AnchorPressure, 8> AnchorPressures;
   llvm::SmallVector<ExtensionPressure, 8> ExtensionPressures;
   llvm::SmallVector<CompareRetargetPressure, 8> CompareRetargetPressures;
