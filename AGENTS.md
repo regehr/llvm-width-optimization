@@ -11,7 +11,7 @@ Follow the rules below unless the user explicitly overrides them.
 - Use the docs to understand current scope, policy boundaries, and which
   transforms are already intended to exist.
 
-## High-Level Agent Workflow
+## High-Level Agent Playbook
 
 Often, you will be asked to improve this width optimizer. Here's how
 to do it.
@@ -19,8 +19,10 @@ to do it.
    optimized away, but that the current pass cannot handle. If you cannot
    create such a file, then say so and ask for help from the user.
 2. Verify that the pass cannot perform the desired transformations by
-   running the pass.
+   running the pass. If the pass can perform it, then you need to go back
+   to step 1.
 3. Verify that the desired transformation is a refinement using `alive-tv`.
+   If it is not, then you need to revise the transformation.
 4. Fix WidthOpt.cpp to handle the new example.
 5. Add one or more unit tests based on the example.
 
@@ -57,9 +59,8 @@ to do it.
 
 ## Verification
 
-- After implementation, run focused tests for the changed area first.
-- Then run the full lit suite for the patched build.
-- Run Alive2 to check correctness of the transformation
+- Run the full lit test suite early and often. It is cheap and fast!
+- Use Alive2 to check correctness of every transformation
 
 ## Alive2 Crash Handling
 
@@ -67,6 +68,7 @@ to do it.
   IR pair.
 - Store reduced reproducers under `repro/` rather than `test/`, so they do not
   get picked up by normal lit or corpus verification automatically.
+- Tell the user that an Alive2 crash bug has been found
 
 ## Useful Commands
 

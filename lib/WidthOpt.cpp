@@ -518,6 +518,65 @@ getKnownCompareResultWithConstantLHS(ICmpInst::Predicate Pred,
   return std::nullopt;
 }
 
+std::optional<bool>
+getKnownCompareResultWithExtAndConstant(ICmpInst::Predicate Pred, ExtKind Kind,
+                                        unsigned NarrowWidth,
+                                        const APInt &ConstValue) {
+  unsigned WideWidth = ConstValue.getBitWidth();
+
+  if (Kind == ExtKind::ZExt) {
+    APInt Max = APInt::getLowBitsSet(WideWidth, NarrowWidth);
+    if (ConstValue.ule(Max))
+      return std::nullopt;
+
+    if (isEqOrNe(Pred))
+      return Pred == ICmpInst::ICMP_NE;
+    if (!isUnsignedICmp(Pred))
+      return std::nullopt;
+
+    switch (Pred) {
+    case ICmpInst::ICMP_ULT:
+    case ICmpInst::ICMP_ULE:
+      return true;
+    case ICmpInst::ICMP_UGT:
+    case ICmpInst::ICMP_UGE:
+      return false;
+    default:
+      return std::nullopt;
+    }
+  }
+
+  if (Kind == ExtKind::SExt) {
+    APInt Min = APInt::getSignedMinValue(NarrowWidth).sext(WideWidth);
+    APInt Max = APInt::getSignedMaxValue(NarrowWidth).sext(WideWidth);
+    if (ConstValue.sge(Min) && ConstValue.sle(Max))
+      return std::nullopt;
+
+    if (isEqOrNe(Pred))
+      return Pred == ICmpInst::ICMP_NE;
+    if (!isSignedICmp(Pred))
+      return std::nullopt;
+
+    bool BelowRange = ConstValue.slt(Min);
+    bool AboveRange = ConstValue.sgt(Max);
+    assert((BelowRange || AboveRange) &&
+           "Out-of-range compare constant should not be in range");
+
+    switch (Pred) {
+    case ICmpInst::ICMP_SLT:
+    case ICmpInst::ICMP_SLE:
+      return AboveRange;
+    case ICmpInst::ICMP_SGT:
+    case ICmpInst::ICMP_SGE:
+      return BelowRange;
+    default:
+      return std::nullopt;
+    }
+  }
+
+  return std::nullopt;
+}
+
 Value *buildConstantAwareICmp(IRBuilder<> &B, ICmpInst::Predicate Pred,
                               Value *LHS, Value *RHS, const Twine &Name = "") {
   if (auto *CLHS = dyn_cast<ConstantInt>(LHS)) {
@@ -570,16 +629,25 @@ bool tryShrinkICmpExtConst(ICmpInst &Cmp) {
     if (!isCompatiblePredForExtKind(NormalizedPred, ExtInfo->Kind))
       continue;
 
-    if (!canRepresentConstant(*C, ExtInfo->Kind, ExtInfo->NarrowWidth))
-      continue;
-
-    Constant *NarrowC = convertConstantToNarrow(*C, ExtInfo->NarrowWidth);
-
     IRBuilder<> B(&Cmp);
-    auto *NewCmp = cast<ICmpInst>(
-        B.CreateICmp(NormalizedPred, ExtInfo->NarrowValue, NarrowC));
-    NewCmp->setDebugLoc(Cmp.getDebugLoc());
-    NewCmp->takeName(&Cmp);
+    Value *NewCmp = nullptr;
+    if (canRepresentConstant(*C, ExtInfo->Kind, ExtInfo->NarrowWidth)) {
+      Constant *NarrowC = convertConstantToNarrow(*C, ExtInfo->NarrowWidth);
+      NewCmp = buildConstantAwareICmp(B, NormalizedPred, ExtInfo->NarrowValue,
+                                      NarrowC, Cmp.getName());
+    } else {
+      auto Known = getKnownCompareResultWithExtAndConstant(
+          NormalizedPred, ExtInfo->Kind, ExtInfo->NarrowWidth, C->getValue());
+      if (!Known)
+        continue;
+      NewCmp = ConstantInt::get(Cmp.getType(), *Known);
+    }
+
+    if (auto *NewCmpI = dyn_cast<Instruction>(NewCmp)) {
+      NewCmpI->setDebugLoc(Cmp.getDebugLoc());
+      if (!NewCmpI->hasName())
+        NewCmpI->takeName(&Cmp);
+    }
     Cmp.replaceAllUsesWith(NewCmp);
     Cmp.eraseFromParent();
 
