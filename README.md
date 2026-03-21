@@ -90,6 +90,13 @@ complement the planner.
     width
   - `shl` by a constant strictly less than the target width (also works when
     nested inside a larger low-bits expression)
+  - `lshr` by a constant strictly less than the target width when the shifted
+    value is a zero-extension from at most the target width (guarantees no
+    nonzero high bits shift into the truncated region)
+  - `ashr` by a constant strictly less than the target width when the shifted
+    value is a sign-extension from at most the target width (upper bits are
+    all copies of the sign bit, so the arithmetic shift stays correct at
+    narrow width)
   - `select`
   - simple loop-carried `shl` recurrences
 - `udiv` retargeting when range facts and removable width changes make it
@@ -264,7 +271,7 @@ proof and regression discipline.
 
 - handle vector instructions
 - broaden trunc-rooted shrinking beyond the current low-bit-preserving
-  binops (including `shl` by small constant), `select`, and shift-recurrence
-  cases (e.g. `lshr`, `ashr` may be tractable in some cases)
+  binops (including `shl`, `lshr`, and `ashr` by small constant) and
+  `select` and shift-recurrence cases
 - add more direct profitability modeling so local widen/narrow decisions align
   better with the global objective

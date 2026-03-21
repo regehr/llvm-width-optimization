@@ -1469,12 +1469,39 @@ bool tryShrinkTruncOfLowBitsBinOp(TruncInst &Tr) {
   // shl with a constant shift amount less than TargetWidth is low-bit
   // preserving: (a << k) mod 2^N = ((a mod 2^N) << k) mod 2^N. Requiring
   // the amount to be less than TargetWidth keeps the narrow shl well-defined.
+  //
+  // lshr by constant k < TargetWidth is safe when the LHS is a
+  // zero-extension from at most TargetWidth bits. That guarantees the bits
+  // above position TargetWidth+k-1 are zero, so the logical shift cannot
+  // bring nonzero high bits into the truncated region.
   if (!isTruncRootedLowBitsPreservingOpcode(BO->getOpcode())) {
-    if (BO->getOpcode() != Instruction::Shl)
+    if (BO->getOpcode() == Instruction::Shl) {
+      auto *AmtC = dyn_cast<ConstantInt>(BO->getOperand(1));
+      if (!AmtC || AmtC->getValue().uge(TargetWidth))
+        return false;
+    } else if (BO->getOpcode() == Instruction::LShr) {
+      auto *AmtC = dyn_cast<ConstantInt>(BO->getOperand(1));
+      if (!AmtC || AmtC->getValue().uge(TargetWidth))
+        return false;
+      auto LHSInfo = getExtOperandInfo(BO->getOperand(0));
+      if (!LHSInfo || LHSInfo->Kind != ExtKind::ZExt ||
+          LHSInfo->NarrowWidth > TargetWidth)
+        return false;
+    } else if (BO->getOpcode() == Instruction::AShr) {
+      // ashr by constant k < TargetWidth is safe when the LHS is a
+      // sign-extension from at most TargetWidth bits. The upper bits are all
+      // copies of the sign bit, so the arithmetic shift cannot pull an
+      // incorrect sign bit into the truncated region.
+      auto *AmtC = dyn_cast<ConstantInt>(BO->getOperand(1));
+      if (!AmtC || AmtC->getValue().uge(TargetWidth))
+        return false;
+      auto LHSInfo = getExtOperandInfo(BO->getOperand(0));
+      if (!LHSInfo || LHSInfo->Kind != ExtKind::SExt ||
+          LHSInfo->NarrowWidth > TargetWidth)
+        return false;
+    } else {
       return false;
-    auto *AmtC = dyn_cast<ConstantInt>(BO->getOperand(1));
-    if (!AmtC || AmtC->getValue().uge(TargetWidth))
-      return false;
+    }
   }
 
   SmallPtrSet<Value *, 8> AddedValues;
@@ -1571,12 +1598,30 @@ Value *materializeTruncRootedValueAtWidth(Value *V, unsigned TargetWidth,
 
   if (auto *BO = dyn_cast<BinaryOperator>(V)) {
     if (!isTruncRootedLowBitsPreservingOpcode(BO->getOpcode())) {
-      // shl with a constant amount < TargetWidth is also low-bit preserving.
-      if (BO->getOpcode() != Instruction::Shl)
+      if (BO->getOpcode() == Instruction::Shl) {
+        // shl with a constant amount < TargetWidth is also low-bit preserving.
+        auto *AmtC = dyn_cast<ConstantInt>(BO->getOperand(1));
+        if (!AmtC || AmtC->getValue().uge(TargetWidth))
+          return nullptr;
+      } else if (BO->getOpcode() == Instruction::LShr) {
+        auto *AmtC = dyn_cast<ConstantInt>(BO->getOperand(1));
+        if (!AmtC || AmtC->getValue().uge(TargetWidth))
+          return nullptr;
+        auto LHSInfo = getExtOperandInfo(BO->getOperand(0));
+        if (!LHSInfo || LHSInfo->Kind != ExtKind::ZExt ||
+            LHSInfo->NarrowWidth > TargetWidth)
+          return nullptr;
+      } else if (BO->getOpcode() == Instruction::AShr) {
+        auto *AmtC = dyn_cast<ConstantInt>(BO->getOperand(1));
+        if (!AmtC || AmtC->getValue().uge(TargetWidth))
+          return nullptr;
+        auto LHSInfo = getExtOperandInfo(BO->getOperand(0));
+        if (!LHSInfo || LHSInfo->Kind != ExtKind::SExt ||
+            LHSInfo->NarrowWidth > TargetWidth)
+          return nullptr;
+      } else {
         return nullptr;
-      auto *AmtC = dyn_cast<ConstantInt>(BO->getOperand(1));
-      if (!AmtC || AmtC->getValue().uge(TargetWidth))
-        return nullptr;
+      }
     }
     Value *NarrowLHS =
         materializeTruncRootedValueAtWidth(BO->getOperand(0), TargetWidth,
@@ -1652,6 +1697,45 @@ bool collectTruncRootedValueCost(
     if (BO->getOpcode() == Instruction::Shl) {
       auto *AmtC = dyn_cast<ConstantInt>(BO->getOperand(1));
       if (!AmtC || AmtC->getValue().uge(TargetWidth))
+        return false;
+      if (!collectTruncRootedValueCost(BO->getOperand(0), TargetWidth,
+                                       AddedValues, RemovedInstructions,
+                                       Visited))
+        return false;
+      AddedValues.insert(V);
+      if (BO->hasOneUse())
+        RemovedInstructions.insert(BO);
+      return true;
+    }
+    // lshr by constant k < TargetWidth is safe when the LHS is a
+    // zero-extension from at most TargetWidth bits (same condition as the
+    // tryShrinkTruncOfLowBitsBinOp entry check).
+    if (BO->getOpcode() == Instruction::LShr) {
+      auto *AmtC = dyn_cast<ConstantInt>(BO->getOperand(1));
+      if (!AmtC || AmtC->getValue().uge(TargetWidth))
+        return false;
+      auto LHSInfo = getExtOperandInfo(BO->getOperand(0));
+      if (!LHSInfo || LHSInfo->Kind != ExtKind::ZExt ||
+          LHSInfo->NarrowWidth > TargetWidth)
+        return false;
+      if (!collectTruncRootedValueCost(BO->getOperand(0), TargetWidth,
+                                       AddedValues, RemovedInstructions,
+                                       Visited))
+        return false;
+      AddedValues.insert(V);
+      if (BO->hasOneUse())
+        RemovedInstructions.insert(BO);
+      return true;
+    }
+    // ashr by constant k < TargetWidth is safe when the LHS is a
+    // sign-extension from at most TargetWidth bits.
+    if (BO->getOpcode() == Instruction::AShr) {
+      auto *AmtC = dyn_cast<ConstantInt>(BO->getOperand(1));
+      if (!AmtC || AmtC->getValue().uge(TargetWidth))
+        return false;
+      auto LHSInfo = getExtOperandInfo(BO->getOperand(0));
+      if (!LHSInfo || LHSInfo->Kind != ExtKind::SExt ||
+          LHSInfo->NarrowWidth > TargetWidth)
         return false;
       if (!collectTruncRootedValueCost(BO->getOperand(0), TargetWidth,
                                        AddedValues, RemovedInstructions,
