@@ -42,7 +42,6 @@ Implemented today:
 - local compare shrinking for selected ext/ext patterns
 - local compare shrinking for mixed `sext`/`zext` `eq/ne`, including the extra
   distinguishing bit needed for equal-width mixed-sign cases
-- local `icmp` + `select` to min/max canonicalization
 - local `phi` and `select` shrinking for `zext`/`sext` inputs plus fitting
   constants, including mixed narrow widths through a common intermediate width
   plus direct repair of trunc and zero-compare users from narrowed selects
@@ -308,23 +307,6 @@ icmp slt (sext x:iN -> W), (zext y:iM -> W)
 
 can often be narrowed to width `max(N, M)`, interpreting `x` as signed and `y` as zero-extended to that width.
 
-5. Min/max introduction as a separate rule
-
-Patterns like:
-
-```llvm
-%c = icmp slt T %x, %y
-%r = select i1 %c, T %y, T %x
-```
-
-should be recognized independently as:
-
-```llvm
-%r = call T @llvm.smax.T(%x, %y)
-```
-
-Introducing `smax` or `umax` should be independent from width-changing transforms. This keeps the optimization pipeline modular.
-
 ## Fact-Based Legality Rules
 
 Structural rules should be combined with standard LLVM-style analyses.
@@ -569,42 +551,6 @@ Current prototype:
 ### 8. Rewrite IR
 
 Retarget chosen components to their selected widths and insert boundary conversions where needed.
-
-### 9. Cleanup
-
-Run standard simplification passes such as:
-
-- InstCombine
-- DCE
-
-## Pass Placement Assumptions
-
-The first prototype should assume a simple placement in a short experimental
-pipeline rather than trying to thread itself into the full LLVM pipeline in a
-subtle way.
-
-A reasonable starting point is:
-
-```text
-instcombine
-correlated-propagation
-width-opt
-instcombine
-dce
-```
-
-The rationale is:
-
-- pre-cleanup exposes local canonical forms and range-driven facts
-- the width pass then reasons over simplified IR
-- post-cleanup removes temporary casts and re-canonicalizes the result
-
-Version 1 should therefore be implemented as a standalone function pass that is
-useful in a short fixed pipeline.
-
-That remains a good experimental placement for the current out-of-tree plugin.
-The prototype does not yet attempt to integrate itself into LLVM's default
-mid-end pipeline.
 
 ## Pseudocode
 

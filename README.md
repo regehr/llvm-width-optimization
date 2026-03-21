@@ -67,7 +67,6 @@ complement the planner.
     needed
   - `zext` against a fitting constant for eq/ne/unsigned predicates
   - `sext` against a fitting constant for eq/ne/signed predicates
-- `icmp` + `select` to `llvm.smin/smax/umin/umax`
 - `phi` shrinking for `zext` or `sext` inputs plus fitting constants,
   including mixed narrow widths through a common intermediate width
 - `select` shrinking for `zext` or `sext` arms plus fitting constants,

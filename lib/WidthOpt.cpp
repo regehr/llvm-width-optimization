@@ -43,13 +43,6 @@ enum class ExtKind {
   SExt,
 };
 
-enum class MinMaxKind {
-  None,
-  SMin,
-  SMax,
-  UMin,
-  UMax,
-};
 
 struct PhiShrinkInfo {
   ExtKind Kind = ExtKind::None;
@@ -348,18 +341,6 @@ Constant *convertConstantToNarrow(ConstantInt &C, unsigned NarrowWidth) {
                           C.getValue().trunc(NarrowWidth));
 }
 
-bool areEquivalentValues(Value *A, Value *B) {
-  if (A == B)
-    return true;
-
-  auto EA = getExtOperandInfo(A);
-  auto EB = getExtOperandInfo(B);
-  if (!EA || !EB)
-    return false;
-
-  return EA->Kind == EB->Kind && EA->NarrowWidth == EB->NarrowWidth &&
-         EA->WideWidth == EB->WideWidth && EA->NarrowValue == EB->NarrowValue;
-}
 
 bool isEqOrNe(ICmpInst::Predicate Pred) {
   return Pred == ICmpInst::ICMP_EQ || Pred == ICmpInst::ICMP_NE;
@@ -783,99 +764,6 @@ bool tryWidenTruncZeroExtendedICmp(ICmpInst &Cmp, const DataLayout &DL,
   return tryOneDirection(0) || tryOneDirection(1);
 }
 
-bool isRelationalLess(ICmpInst::Predicate Pred) {
-  return Pred == ICmpInst::ICMP_SLT || Pred == ICmpInst::ICMP_SLE ||
-         Pred == ICmpInst::ICMP_ULT || Pred == ICmpInst::ICMP_ULE;
-}
-
-bool isRelationalGreater(ICmpInst::Predicate Pred) {
-  return Pred == ICmpInst::ICMP_SGT || Pred == ICmpInst::ICMP_SGE ||
-         Pred == ICmpInst::ICMP_UGT || Pred == ICmpInst::ICMP_UGE;
-}
-
-MinMaxKind getMinMaxKind(ICmpInst::Predicate Pred, bool TrueIsLHS) {
-  if (isSignedICmp(Pred)) {
-    if (isRelationalLess(Pred))
-      return TrueIsLHS ? MinMaxKind::SMin : MinMaxKind::SMax;
-    if (isRelationalGreater(Pred))
-      return TrueIsLHS ? MinMaxKind::SMax : MinMaxKind::SMin;
-    return MinMaxKind::None;
-  }
-
-  if (isUnsignedICmp(Pred)) {
-    if (isRelationalLess(Pred))
-      return TrueIsLHS ? MinMaxKind::UMin : MinMaxKind::UMax;
-    if (isRelationalGreater(Pred))
-      return TrueIsLHS ? MinMaxKind::UMax : MinMaxKind::UMin;
-    return MinMaxKind::None;
-  }
-
-  return MinMaxKind::None;
-}
-
-Intrinsic::ID getIntrinsicForMinMaxKind(MinMaxKind K) {
-  switch (K) {
-  case MinMaxKind::SMin:
-    return Intrinsic::smin;
-  case MinMaxKind::SMax:
-    return Intrinsic::smax;
-  case MinMaxKind::UMin:
-    return Intrinsic::umin;
-  case MinMaxKind::UMax:
-    return Intrinsic::umax;
-  case MinMaxKind::None:
-    break;
-  }
-  llvm_unreachable("Unexpected min/max kind");
-}
-
-bool tryConvertSelectToMinMax(SelectInst &Sel) {
-  auto *Ty = dyn_cast<IntegerType>(Sel.getType());
-  if (!Ty)
-    return false;
-
-  auto *Cmp = dyn_cast<ICmpInst>(Sel.getCondition());
-  if (!Cmp)
-    return false;
-
-  Value *LHS = Cmp->getOperand(0);
-  Value *RHS = Cmp->getOperand(1);
-  Value *TV = Sel.getTrueValue();
-  Value *FV = Sel.getFalseValue();
-
-  if (TV->getType() != Sel.getType() || FV->getType() != Sel.getType())
-    return false;
-  if (LHS->getType() != Sel.getType() || RHS->getType() != Sel.getType())
-    return false;
-
-  bool TrueIsLHS = false;
-  bool Matched = false;
-  if (areEquivalentValues(TV, LHS) && areEquivalentValues(FV, RHS)) {
-    TrueIsLHS = true;
-    Matched = true;
-  } else if (areEquivalentValues(TV, RHS) && areEquivalentValues(FV, LHS)) {
-    TrueIsLHS = false;
-    Matched = true;
-  }
-
-  if (!Matched)
-    return false;
-
-  MinMaxKind K = getMinMaxKind(Cmp->getPredicate(), TrueIsLHS);
-  if (K == MinMaxKind::None)
-    return false;
-
-  IRBuilder<> B(&Sel);
-  Value *MinMax =
-      B.CreateBinaryIntrinsic(getIntrinsicForMinMaxKind(K), FV, TV);
-  Sel.replaceAllUsesWith(MinMax);
-  Sel.eraseFromParent();
-
-  if (Cmp->use_empty())
-    RecursivelyDeleteTriviallyDeadInstructions(Cmp);
-
-  return true;
-}
 
 bool tryShrinkPhiOfExts(PHINode &Phi) {
   auto *WideTy = dyn_cast<IntegerType>(Phi.getType());
@@ -2769,10 +2657,6 @@ bool runStructuralLocalRewritesToFixpoint(Function &F) {
     for (SelectInst *Sel : WL.Selects) {
       if (Sel->getParent() == nullptr)
         continue;
-      if (tryConvertSelectToMinMax(*Sel)) {
-        ChangedThisRound = true;
-        continue;
-      }
       ChangedThisRound |= tryShrinkSelectOfExts(*Sel);
     }
 
