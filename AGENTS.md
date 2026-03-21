@@ -11,17 +11,18 @@ Follow the rules below unless the user explicitly overrides them.
 - Use the docs to understand current scope, policy boundaries, and which
   transforms are already intended to exist.
 
-## Review Scope
+## High-Level Agent Workflow
 
-- When asked to review effectiveness, focus on weaknesses or flaws in the
-  existing logic that cause the pass to remove fewer width changes than it
-  should.
-- Do not pad the review with speculative new features that the pass does not
-  currently aim to handle. Keep the distinction clear:
-  - existing logic that is weak, inconsistent, or needlessly conservative
-  - new functionality that would broaden scope
-- If you identify a correctness concern while reviewing effectiveness, call it
-  out separately.
+Often, you will be asked to improve this width optimizer. Here's how
+to do it.
+1. Create an LLVM IR file that contains width instructions that can be
+   optimized away, but that the current pass cannot handle. If you cannot
+   create such a file, then say so and ask for help from the user.
+2. Verify that the pass cannot perform the desired transformations by
+   running the pass.
+3. Verify that the desired transformation is a refinement using `alive-tv`.
+4. Fix WidthOpt.cpp to handle the new example.
+5. Add one or more unit tests based on the example.
 
 ## README TODO Discipline
 
@@ -31,13 +32,6 @@ Follow the rules below unless the user explicitly overrides them.
   - add new concrete items when they are discovered
   - remove items once they are completed
 - Do not leave completed work in the active TODO list.
-
-## Implementation Priorities
-
-- Prefer high-priority, self-contained items that improve effectiveness within
-  the current supported scope.
-- Make progress proactively. Do not wait for the user to remind you to update
-  TODOs, add tests, or run broader verification.
 
 ## Mandatory Scope Boundary
 
