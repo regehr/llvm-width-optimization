@@ -1508,6 +1508,26 @@ bool tryFoldTruncOfExt(TruncInst &Tr) {
   return true;
 }
 
+// Returns true if V is provably zero in all bit positions >= Width.
+// This is a conservative structural check: it covers direct zero-extensions,
+// bitwise operations (and/or/xor) of zero-bounded operands, and constant
+// integers whose value fits in Width bits unsigned.  It does not require
+// KnownBits analysis.
+bool isZeroBoundedAtWidth(Value *V, unsigned Width) {
+  if (auto Ext = getExtOperandInfo(V))
+    return Ext->Kind == ExtKind::ZExt && Ext->NarrowWidth <= Width;
+  if (auto *C = dyn_cast<ConstantInt>(V))
+    return C->getValue().isIntN(Width);
+  if (auto *BO = dyn_cast<BinaryOperator>(V)) {
+    if (BO->getOpcode() == Instruction::And ||
+        BO->getOpcode() == Instruction::Or ||
+        BO->getOpcode() == Instruction::Xor)
+      return isZeroBoundedAtWidth(BO->getOperand(0), Width) &&
+             isZeroBoundedAtWidth(BO->getOperand(1), Width);
+  }
+  return false;
+}
+
 bool isTruncRootedLowBitsPreservingOpcode(unsigned Opcode);
 
 Value *materializeTruncRootedValueAtWidth(Value *V, unsigned TargetWidth,
@@ -1551,9 +1571,7 @@ bool tryShrinkTruncOfLowBitsBinOp(TruncInst &Tr) {
       auto *AmtC = dyn_cast<ConstantInt>(BO->getOperand(1));
       if (!AmtC || AmtC->getValue().uge(TargetWidth))
         return false;
-      auto LHSInfo = getExtOperandInfo(BO->getOperand(0));
-      if (!LHSInfo || LHSInfo->Kind != ExtKind::ZExt ||
-          LHSInfo->NarrowWidth > TargetWidth)
+      if (!isZeroBoundedAtWidth(BO->getOperand(0), TargetWidth))
         return false;
     } else if (BO->getOpcode() == Instruction::AShr) {
       // ashr by constant k < TargetWidth is safe when the LHS is a
@@ -1675,9 +1693,7 @@ Value *materializeTruncRootedValueAtWidth(Value *V, unsigned TargetWidth,
         auto *AmtC = dyn_cast<ConstantInt>(BO->getOperand(1));
         if (!AmtC || AmtC->getValue().uge(TargetWidth))
           return nullptr;
-        auto LHSInfo = getExtOperandInfo(BO->getOperand(0));
-        if (!LHSInfo || LHSInfo->Kind != ExtKind::ZExt ||
-            LHSInfo->NarrowWidth > TargetWidth)
+        if (!isZeroBoundedAtWidth(BO->getOperand(0), TargetWidth))
           return nullptr;
       } else if (BO->getOpcode() == Instruction::AShr) {
         auto *AmtC = dyn_cast<ConstantInt>(BO->getOperand(1));
@@ -1775,16 +1791,14 @@ bool collectTruncRootedValueCost(
         RemovedInstructions.insert(BO);
       return true;
     }
-    // lshr by constant k < TargetWidth is safe when the LHS is a
-    // zero-extension from at most TargetWidth bits (same condition as the
+    // lshr by constant k < TargetWidth is safe when the LHS has all bits
+    // above TargetWidth-1 provably zero (same condition as the
     // tryShrinkTruncOfLowBitsBinOp entry check).
     if (BO->getOpcode() == Instruction::LShr) {
       auto *AmtC = dyn_cast<ConstantInt>(BO->getOperand(1));
       if (!AmtC || AmtC->getValue().uge(TargetWidth))
         return false;
-      auto LHSInfo = getExtOperandInfo(BO->getOperand(0));
-      if (!LHSInfo || LHSInfo->Kind != ExtKind::ZExt ||
-          LHSInfo->NarrowWidth > TargetWidth)
+      if (!isZeroBoundedAtWidth(BO->getOperand(0), TargetWidth))
         return false;
       if (!collectTruncRootedValueCost(BO->getOperand(0), TargetWidth,
                                        AddedValues, RemovedInstructions,
