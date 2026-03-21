@@ -28,10 +28,10 @@ The repository currently contains:
 - a candidate-width analysis that infers alternative widths from ext/trunc use
   patterns
 - a first width-plan analysis that chooses per-component widths with a simple
-  graph-labeling heuristic with weighted boundary pressure, anchor pressure
-  from fixed external uses, extension-kind-aware mismatch penalties that
-  account for opposite-kind boundary reconstruction, and compare-retarget sign
-  pressure
+  graph-labeling heuristic with single-node plus pairwise local-improvement
+  steps, weighted boundary pressure, anchor pressure from fixed external uses,
+  extension-kind-aware mismatch penalties that account for opposite-kind
+  boundary reconstruction, and compare-retarget sign pressure
 - planner-side compare affinities so `icmp` operands can influence width
   choice directly
 - a growing set of conservative local rewrites for compare, trunc-rooted, and
@@ -47,9 +47,10 @@ The current optimizer is still conservative, but it is no longer purely local.
 The global plan now drives widening of small width-polymorphic components and
 uses compare affinities plus weighted repeated boundary pressure, anchor
 pressure from fixed external uses, extension-kind-aware mismatch penalties
-that account for opposite-kind boundary reconstruction, and compare-retarget
-sign pressure to influence width choices. At the same time, a large fraction
-of the implemented behavior currently comes from targeted local rewrites that
+that account for opposite-kind boundary reconstruction, compare-retarget sign
+pressure, and a small pairwise-improvement escape hatch for two-component
+local minima to influence width choices. At the same time, a large fraction of
+the implemented behavior currently comes from targeted local rewrites that
 complement the planner.
 
 ## Implemented Local Rewrites
@@ -243,6 +244,9 @@ proof and regression discipline.
   recreating casts per external use.
 - generalize the global planner beyond the current simple heuristic and binary
   candidate model
+  The planner now includes a pairwise local-improvement step to escape simple
+  two-component traps, but it is still not the exact or near-exact global
+  solver described in the design.
 - broaden plan-driven rewrites to more instruction kinds than the current small
   width-polymorphic regions plus the currently supported singleton cast/minmax
   cases

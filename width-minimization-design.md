@@ -73,8 +73,9 @@ Implemented today:
 - weighted planner pressure for repeated def-use boundaries, fixed external
   anchor uses, extension-kind mismatches at target width including the extra
   boundary reconstruction cost of opposite-kind ext users, compare-retarget
-  sign pressure, and repeated compare affinities between the same component
-  pairs
+  sign pressure, repeated compare affinities between the same component pairs,
+  and a small pairwise local-improvement step to escape simple two-component
+  local minima
 
 Current policy boundaries:
 
@@ -115,9 +116,9 @@ This turns the optimization problem into a binary graph labeling problem, which
 can be solved exactly with a min-cut style formulation.
 
 That exact binary formulation is still the long-term design target. The current
-prototype uses a simpler candidate graph plus iterative local-improvement
-heuristic, then applies plan-driven rewrites where the implementation supports
-them.
+prototype uses a simpler candidate graph plus iterative single-node and
+pairwise local-improvement heuristic, then applies plan-driven rewrites where
+the implementation supports them.
 
 ## Anchors
 

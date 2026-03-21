@@ -2170,6 +2170,82 @@ bool isBetterWidthChoice(const Component &C, unsigned CandidateWidth,
   return false;
 }
 
+SmallVector<unsigned, 4> getPlanningCandidateWidths(const Component &C) {
+  SmallVector<unsigned, 4> Widths = C.CandidateWidths;
+  if (!llvm::is_contained(Widths, C.OrigWidth))
+    Widths.push_back(C.OrigWidth);
+  llvm::sort(Widths);
+  return Widths;
+}
+
+unsigned computePlanCost(const AnalysisResult &R,
+                         ArrayRef<unsigned> ChosenWidths) {
+  unsigned TotalCost = 0;
+  for (const ComponentEdge &E : R.Edges)
+    TotalCost +=
+        E.Weight * edgeCutCost(ChosenWidths[E.From], ChosenWidths[E.To]);
+  for (const CompareAffinity &A : R.CompareAffinities) {
+    assert(A.LHS < ChosenWidths.size() && A.RHS < ChosenWidths.size() &&
+           "Compare affinities should reference valid component IDs");
+    TotalCost += A.Weight *
+                 compareAffinityCost(ChosenWidths[A.LHS], ChosenWidths[A.RHS]);
+  }
+  for (const AnchorPressure &A : R.AnchorPressures) {
+    assert(A.Component < ChosenWidths.size() &&
+           "Anchor pressure should reference a valid component ID");
+    TotalCost +=
+        A.Weight * anchorPressureCost(ChosenWidths[A.Component], A.Width);
+  }
+  TotalCost += totalExtensionMismatchCost(R, ChosenWidths);
+  TotalCost += totalCompareRetargetMismatchCost(R, ChosenWidths);
+  return TotalCost;
+}
+
+bool applyBestPairwiseImprovement(const AnalysisResult &R,
+                                  MutableArrayRef<unsigned> ChosenWidths) {
+  unsigned CurrentCost = computePlanCost(R, ChosenWidths);
+  unsigned BestCost = CurrentCost;
+  std::optional<unsigned> BestA;
+  std::optional<unsigned> BestB;
+  unsigned BestWidthA = 0;
+  unsigned BestWidthB = 0;
+
+  SmallVector<unsigned, 8> TrialWidths(ChosenWidths.begin(), ChosenWidths.end());
+  for (const Component &A : R.Components) {
+    if (A.Fixed)
+      continue;
+    SmallVector<unsigned, 4> WidthsA = getPlanningCandidateWidths(A);
+    for (const Component &B : R.Components) {
+      if (B.ID <= A.ID || B.Fixed)
+        continue;
+      SmallVector<unsigned, 4> WidthsB = getPlanningCandidateWidths(B);
+      for (unsigned WidthA : WidthsA) {
+        for (unsigned WidthB : WidthsB) {
+          if (WidthA == ChosenWidths[A.ID] && WidthB == ChosenWidths[B.ID])
+            continue;
+          TrialWidths.assign(ChosenWidths.begin(), ChosenWidths.end());
+          TrialWidths[A.ID] = WidthA;
+          TrialWidths[B.ID] = WidthB;
+          unsigned Cost = computePlanCost(R, TrialWidths);
+          if (Cost >= BestCost)
+            continue;
+          BestCost = Cost;
+          BestA = A.ID;
+          BestB = B.ID;
+          BestWidthA = WidthA;
+          BestWidthB = WidthB;
+        }
+      }
+    }
+  }
+
+  if (!BestA || !BestB)
+    return false;
+  ChosenWidths[*BestA] = BestWidthA;
+  ChosenWidths[*BestB] = BestWidthB;
+  return true;
+}
+
 PlanResult computeWidthPlan(const AnalysisResult &R) {
   PlanResult Plan;
   Plan.ChosenWidths.reserve(R.Components.size());
@@ -2179,7 +2255,8 @@ PlanResult computeWidthPlan(const AnalysisResult &R) {
     Plan.ChosenWidths.push_back(C.OrigWidth);
   }
 
-  unsigned MaxRounds = std::max<unsigned>(1, R.Components.size() * 4);
+  unsigned MaxRounds =
+      std::max<unsigned>(1, R.Components.size() * R.Components.size());
   for (unsigned Round = 0; Round != MaxRounds; ++Round) {
     bool Changed = false;
 
@@ -2189,10 +2266,7 @@ PlanResult computeWidthPlan(const AnalysisResult &R) {
       if (C.Fixed)
         continue;
 
-      SmallVector<unsigned, 4> Widths = C.CandidateWidths;
-      if (!llvm::is_contained(Widths, C.OrigWidth))
-        Widths.push_back(C.OrigWidth);
-      llvm::sort(Widths);
+      SmallVector<unsigned, 4> Widths = getPlanningCandidateWidths(C);
 
       unsigned BestWidth = Plan.ChosenWidths[C.ID];
       unsigned BestScore =
@@ -2211,7 +2285,14 @@ PlanResult computeWidthPlan(const AnalysisResult &R) {
       }
     }
 
-    if (!Changed)
+    if (Changed)
+      continue;
+
+    // The per-component sweep can get stuck when two components need to move
+    // together, for example across a compare edge where either isolated move
+    // looks neutral but the joint move lowers total cost. Try one strictly
+    // improving pairwise step before giving up.
+    if (!applyBestPairwiseImprovement(R, Plan.ChosenWidths))
       break;
   }
 
@@ -2219,24 +2300,7 @@ PlanResult computeWidthPlan(const AnalysisResult &R) {
   // component graph, not the eventual exact binary solver described in the
   // design document. Keep the reported total cost in the same cost model the
   // chooser used so debug output stays interpretable.
-  for (const ComponentEdge &E : R.Edges)
-    Plan.TotalCutCost +=
-        E.Weight * edgeCutCost(Plan.ChosenWidths[E.From], Plan.ChosenWidths[E.To]);
-  for (const CompareAffinity &A : R.CompareAffinities) {
-    assert(A.LHS < Plan.ChosenWidths.size() && A.RHS < Plan.ChosenWidths.size() &&
-           "Compare affinities should reference valid component IDs");
-    Plan.TotalCutCost +=
-        A.Weight *
-        compareAffinityCost(Plan.ChosenWidths[A.LHS], Plan.ChosenWidths[A.RHS]);
-  }
-  for (const AnchorPressure &A : R.AnchorPressures) {
-    assert(A.Component < Plan.ChosenWidths.size() &&
-           "Anchor pressure should reference a valid component ID");
-    Plan.TotalCutCost +=
-        A.Weight * anchorPressureCost(Plan.ChosenWidths[A.Component], A.Width);
-  }
-  Plan.TotalCutCost += totalExtensionMismatchCost(R, Plan.ChosenWidths);
-  Plan.TotalCutCost += totalCompareRetargetMismatchCost(R, Plan.ChosenWidths);
+  Plan.TotalCutCost = computePlanCost(R, Plan.ChosenWidths);
 
   return Plan;
 }
