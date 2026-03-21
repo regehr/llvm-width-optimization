@@ -65,6 +65,8 @@ complement the planner.
   - mixed `sext/zext` for signed predicates
   - mixed `sext/zext` for `eq/ne`, with one extra distinguishing bit when
     needed
+  - `zext` against a fitting constant for eq/ne/unsigned predicates
+  - `sext` against a fitting constant for eq/ne/signed predicates
 - `icmp` + `select` to `llvm.smin/smax/umin/umax`
 - `phi` shrinking for `zext` or `sext` inputs plus fitting constants,
   including mixed narrow widths through a common intermediate width
@@ -87,6 +89,8 @@ complement the planner.
   - low-bit-preserving `add/sub/mul/and/or/xor` expressions when removable
     boundary instructions pay for rebuilding the expression at the truncated
     width
+  - `shl` by a constant strictly less than the target width (also works when
+    nested inside a larger low-bits expression)
   - `select`
   - simple loop-carried `shl` recurrences
 - `udiv` retargeting when range facts and removable width changes make it
@@ -261,6 +265,7 @@ proof and regression discipline.
 
 - handle vector instructions
 - broaden trunc-rooted shrinking beyond the current low-bit-preserving
-  binops, `select`, and shift-recurrence cases
+  binops (including `shl` by small constant), `select`, and shift-recurrence
+  cases (e.g. `lshr`, `ashr` may be tractable in some cases)
 - add more direct profitability modeling so local widen/narrow decisions align
   better with the global objective

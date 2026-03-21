@@ -555,6 +555,61 @@ Value *buildConstantAwareICmp(IRBuilder<> &B, ICmpInst::Predicate Pred,
   return B.CreateICmp(Pred, LHS, RHS, Name);
 }
 
+// Returns true when Pred is a valid comparison to narrow through an extension
+// of Kind. For zext the unsigned predicates preserve ordering; for sext the
+// signed predicates preserve ordering. eq/ne are valid for either kind.
+bool isCompatiblePredForExtKind(ICmpInst::Predicate Pred, ExtKind Kind) {
+  if (isEqOrNe(Pred))
+    return true;
+  if (Kind == ExtKind::ZExt)
+    return isUnsignedICmp(Pred);
+  if (Kind == ExtKind::SExt)
+    return isSignedICmp(Pred);
+  return false;
+}
+
+// Narrow  icmp pred (ext %x to W), C  →  icmp pred %x, trunc(C)
+// when C fits in the source width of the extension and the predicate is
+// compatible with the extension kind. Also handles the symmetric case where
+// the constant is on the left.
+bool tryShrinkICmpExtConst(ICmpInst &Cmp) {
+  for (unsigned ExtIdx = 0; ExtIdx != 2; ++ExtIdx) {
+    auto ExtInfo = getExtOperandInfo(Cmp.getOperand(ExtIdx));
+    if (!ExtInfo)
+      continue;
+
+    auto *C = dyn_cast<ConstantInt>(Cmp.getOperand(1 - ExtIdx));
+    if (!C)
+      continue;
+
+    // Normalize the predicate so the ext operand is always on the left.
+    ICmpInst::Predicate NormalizedPred =
+        ExtIdx == 0 ? Cmp.getPredicate() : Cmp.getSwappedPredicate();
+
+    if (!isCompatiblePredForExtKind(NormalizedPred, ExtInfo->Kind))
+      continue;
+
+    if (!canRepresentConstant(*C, ExtInfo->Kind, ExtInfo->NarrowWidth))
+      continue;
+
+    Constant *NarrowC = convertConstantToNarrow(*C, ExtInfo->NarrowWidth);
+
+    IRBuilder<> B(&Cmp);
+    auto *NewCmp = cast<ICmpInst>(
+        B.CreateICmp(NormalizedPred, ExtInfo->NarrowValue, NarrowC));
+    NewCmp->setDebugLoc(Cmp.getDebugLoc());
+    NewCmp->takeName(&Cmp);
+    Cmp.replaceAllUsesWith(NewCmp);
+    Cmp.eraseFromParent();
+
+    if (ExtInfo->Producer->use_empty())
+      RecursivelyDeleteTriviallyDeadInstructions(ExtInfo->Producer);
+
+    return true;
+  }
+  return false;
+}
+
 bool tryShrinkICmp(ICmpInst &Cmp) {
   auto LHSInfo = getExtOperandInfo(Cmp.getOperand(0));
   auto RHSInfo = getExtOperandInfo(Cmp.getOperand(1));
@@ -1511,8 +1566,7 @@ bool collectTruncRootedValueCost(
 
 bool tryShrinkTruncOfLowBitsBinOp(TruncInst &Tr) {
   auto *BO = dyn_cast<BinaryOperator>(Tr.getOperand(0));
-  if (!BO || !isTruncRootedLowBitsPreservingOpcode(BO->getOpcode()) ||
-      !BO->hasOneUse())
+  if (!BO || !BO->hasOneUse())
     return false;
   if (!isIntegerValue(&Tr) || !isIntegerValue(BO) ||
       !isIntegerValue(BO->getOperand(0)) || !isIntegerValue(BO->getOperand(1)))
@@ -1523,6 +1577,17 @@ bool tryShrinkTruncOfLowBitsBinOp(TruncInst &Tr) {
   (void)SourceWidth;
   assert(TargetWidth < SourceWidth &&
          "Trunc results must be narrower than their source");
+
+  // shl with a constant shift amount less than TargetWidth is low-bit
+  // preserving: (a << k) mod 2^N = ((a mod 2^N) << k) mod 2^N. Requiring
+  // the amount to be less than TargetWidth keeps the narrow shl well-defined.
+  if (!isTruncRootedLowBitsPreservingOpcode(BO->getOpcode())) {
+    if (BO->getOpcode() != Instruction::Shl)
+      return false;
+    auto *AmtC = dyn_cast<ConstantInt>(BO->getOperand(1));
+    if (!AmtC || AmtC->getValue().uge(TargetWidth))
+      return false;
+  }
 
   SmallPtrSet<Value *, 8> AddedValues;
   SmallPtrSet<Instruction *, 8> RemovedInstructions;
@@ -1617,8 +1682,14 @@ Value *materializeTruncRootedValueAtWidth(Value *V, unsigned TargetWidth,
   }
 
   if (auto *BO = dyn_cast<BinaryOperator>(V)) {
-    if (!isTruncRootedLowBitsPreservingOpcode(BO->getOpcode()))
-      return nullptr;
+    if (!isTruncRootedLowBitsPreservingOpcode(BO->getOpcode())) {
+      // shl with a constant amount < TargetWidth is also low-bit preserving.
+      if (BO->getOpcode() != Instruction::Shl)
+        return nullptr;
+      auto *AmtC = dyn_cast<ConstantInt>(BO->getOperand(1));
+      if (!AmtC || AmtC->getValue().uge(TargetWidth))
+        return nullptr;
+    }
     Value *NarrowLHS =
         materializeTruncRootedValueAtWidth(BO->getOperand(0), TargetWidth,
                                            InsertBefore, Cache);
@@ -1680,6 +1751,21 @@ bool collectTruncRootedValueCost(
                                        AddedValues, RemovedInstructions,
                                        Visited) ||
           !collectTruncRootedValueCost(BO->getOperand(1), TargetWidth,
+                                       AddedValues, RemovedInstructions,
+                                       Visited))
+        return false;
+      AddedValues.insert(V);
+      if (BO->hasOneUse())
+        RemovedInstructions.insert(BO);
+      return true;
+    }
+    // shl with a constant shift amount < TargetWidth is also low-bit
+    // preserving. The constant operand is free; only recurse on the value.
+    if (BO->getOpcode() == Instruction::Shl) {
+      auto *AmtC = dyn_cast<ConstantInt>(BO->getOperand(1));
+      if (!AmtC || AmtC->getValue().uge(TargetWidth))
+        return false;
+      if (!collectTruncRootedValueCost(BO->getOperand(0), TargetWidth,
                                        AddedValues, RemovedInstructions,
                                        Visited))
         return false;
@@ -2673,7 +2759,11 @@ bool runStructuralLocalRewritesToFixpoint(Function &F) {
     for (ICmpInst *Cmp : WL.Compares) {
       if (Cmp->getParent() == nullptr)
         continue;
-      ChangedThisRound |= tryShrinkICmp(*Cmp);
+      if (tryShrinkICmp(*Cmp)) {
+        ChangedThisRound = true;
+        continue;
+      }
+      ChangedThisRound |= tryShrinkICmpExtConst(*Cmp);
     }
 
     for (SelectInst *Sel : WL.Selects) {
