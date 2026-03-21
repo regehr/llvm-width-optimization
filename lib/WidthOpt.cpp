@@ -608,6 +608,119 @@ bool isCompatiblePredForExtKind(ICmpInst::Predicate Pred, ExtKind Kind) {
   return false;
 }
 
+// Forward declarations for helpers used by tryShrinkICmpZeroBounded.
+bool isZeroBoundedAtWidth(Value *V, unsigned Width);
+bool collectTruncRootedValueCost(Value *V, unsigned TargetWidth,
+                                 SmallPtrSetImpl<Value *> &AddedValues,
+                                 SmallPtrSetImpl<Instruction *> &RemovedInstructions,
+                                 SmallPtrSetImpl<Value *> &Visited);
+Value *materializeTruncRootedValueAtWidth(Value *V, unsigned TargetWidth,
+                                          Instruction *InsertBefore,
+                                          DenseMap<Value *, Value *> *Cache);
+
+// Return the structural narrow width of V if its high bits are provably zero
+// by structure alone (direct zext, bitwise trees of such), or 0 if unknown.
+// Constants return 0 (they are width-flexible and not the source of the bound).
+unsigned getStructuralNarrowWidth(Value *V) {
+  if (auto Ext = getExtOperandInfo(V))
+    return Ext->Kind == ExtKind::ZExt ? Ext->NarrowWidth : 0;
+  if (isa<ConstantInt>(V))
+    return 0;
+  if (auto *BO = dyn_cast<BinaryOperator>(V)) {
+    if (BO->getOpcode() == Instruction::And) {
+      unsigned W0 = getStructuralNarrowWidth(BO->getOperand(0));
+      unsigned W1 = getStructuralNarrowWidth(BO->getOperand(1));
+      // and: zero-bounded by whichever operand is bounded; take the narrower.
+      if (W0 != 0 && W1 != 0) return std::min(W0, W1);
+      return W0 != 0 ? W0 : W1;
+    }
+    if (BO->getOpcode() == Instruction::Or ||
+        BO->getOpcode() == Instruction::Xor) {
+      unsigned W0 = getStructuralNarrowWidth(BO->getOperand(0));
+      unsigned W1 = getStructuralNarrowWidth(BO->getOperand(1));
+      if (W0 == 0 || W1 == 0) return 0;
+      return std::max(W0, W1);
+    }
+  }
+  return 0;
+}
+
+// Narrow  icmp pred LHS, RHS  when both sides are structurally zero-bounded
+// at a width smaller than the current comparison width.  Valid for eq/ne and
+// all unsigned predicates.  Handles cases where at least one operand is a
+// bitwise tree of zero-extensions rather than a single direct extension
+// (tryShrinkICmp and tryShrinkICmpExtConst cover direct-ext operands).
+bool tryShrinkICmpZeroBounded(ICmpInst &Cmp) {
+  ICmpInst::Predicate Pred = Cmp.getPredicate();
+  if (!isEqOrNe(Pred) && !isUnsignedICmp(Pred))
+    return false;
+
+  Value *LHS = Cmp.getOperand(0);
+  Value *RHS = Cmp.getOperand(1);
+  if (!isIntegerValue(LHS) || !isIntegerValue(RHS))
+    return false;
+
+  unsigned WideWidth = getValueWidth(LHS);
+  if (WideWidth != getValueWidth(RHS))
+    return false;
+
+  // Derive the target width from the non-constant zero-bounded operand.
+  unsigned TargetWidth = 0;
+  for (Value *V : {LHS, RHS}) {
+    if (!isa<ConstantInt>(V)) {
+      TargetWidth = getStructuralNarrowWidth(V);
+      if (TargetWidth != 0)
+        break;
+    }
+  }
+  if (TargetWidth == 0 || TargetWidth >= WideWidth)
+    return false;
+
+  // Both sides must be zero-bounded at TargetWidth (constants adapt freely).
+  if (!isZeroBoundedAtWidth(LHS, TargetWidth) ||
+      !isZeroBoundedAtWidth(RHS, TargetWidth))
+    return false;
+
+  // Cost check: require that narrowing doesn't add more instructions than it
+  // removes.  We re-use the trunc-rooted cost infrastructure without counting
+  // a trunc removal (there is none here; the icmp is merely replaced).
+  SmallPtrSet<Value *, 8> AddedValues;
+  SmallPtrSet<Instruction *, 8> RemovedInstructions;
+  SmallPtrSet<Value *, 8> Visited;
+  if (!collectTruncRootedValueCost(LHS, TargetWidth, AddedValues,
+                                   RemovedInstructions, Visited) ||
+      !collectTruncRootedValueCost(RHS, TargetWidth, AddedValues,
+                                   RemovedInstructions, Visited))
+    return false;
+  if (AddedValues.size() > RemovedInstructions.size())
+    return false;
+
+  DenseMap<Value *, Value *> Cache;
+  Value *NarrowLHS =
+      materializeTruncRootedValueAtWidth(LHS, TargetWidth, &Cmp, &Cache);
+  Value *NarrowRHS =
+      materializeTruncRootedValueAtWidth(RHS, TargetWidth, &Cmp, &Cache);
+  if (!NarrowLHS || !NarrowRHS)
+    return false;
+
+  IRBuilder<> B(&Cmp);
+  auto *NarrowCmp =
+      cast<ICmpInst>(B.CreateICmp(Pred, NarrowLHS, NarrowRHS, Cmp.getName()));
+  NarrowCmp->setDebugLoc(Cmp.getDebugLoc());
+
+  Cmp.replaceAllUsesWith(NarrowCmp);
+  Cmp.eraseFromParent();
+
+  if (auto *LI = dyn_cast<Instruction>(LHS))
+    if (LI->use_empty())
+      RecursivelyDeleteTriviallyDeadInstructions(LI);
+  if (auto *RI = dyn_cast<Instruction>(RHS))
+    if (RI->use_empty())
+      RecursivelyDeleteTriviallyDeadInstructions(RI);
+
+  return true;
+}
+
 // Narrow  icmp pred (ext %x to W), C  →  icmp pred %x, trunc(C)
 // when C fits in the source width of the extension and the predicate is
 // compatible with the extension kind. Also handles the symmetric case where
@@ -2899,7 +3012,11 @@ bool runStructuralLocalRewritesToFixpoint(Function &F) {
         ChangedThisRound = true;
         continue;
       }
-      ChangedThisRound |= tryShrinkICmpExtConst(*Cmp);
+      if (tryShrinkICmpExtConst(*Cmp)) {
+        ChangedThisRound = true;
+        continue;
+      }
+      ChangedThisRound |= tryShrinkICmpZeroBounded(*Cmp);
     }
 
     for (SelectInst *Sel : WL.Selects) {
