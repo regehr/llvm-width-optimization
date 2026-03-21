@@ -1252,8 +1252,46 @@ bool sextUseAllowsZExt(User &U, SExtInst &Ext) {
         return (Mask->getValue() & ~DemandedMask) == 0;
       }
       return false;
-    case Instruction::LShr:
-      return BO->getOperand(0) == &Ext;
+    case Instruction::LShr: {
+      // lshr(sext(a:N→W), k) is safe to convert sext→zext only when every use
+      // of the lshr result accesses bits that fall within the original narrow
+      // range (0..N-k-1).  Bits N-k..W-k-1 of the lshr result contain sign
+      // bits for sext but zeros for zext, so any use reaching those positions
+      // makes sext and zext non-equivalent.
+      if (BO->getOperand(0) != &Ext)
+        return false;
+      auto *AmtC = dyn_cast<ConstantInt>(BO->getOperand(1));
+      if (!AmtC)
+        return false;
+      unsigned N = getValueWidth(Ext.getOperand(0)); // narrow source width
+      unsigned W = getValueWidth(&Ext);               // wide width
+      uint64_t k = AmtC->getValue().getZExtValue();
+      if (k >= N)
+        return false;
+      // Bits 0..N-k-1 of the lshr result are safe (from original a).
+      APInt SafeMask = APInt::getLowBitsSet(W, N - k);
+      if (BO->use_empty())
+        return false;
+      for (User *LshrUser : BO->users()) {
+        // and(lshr, const_mask) where mask ⊆ SafeMask is fine.
+        if (auto *AndU = dyn_cast<BinaryOperator>(LshrUser)) {
+          if (AndU->getOpcode() != Instruction::And)
+            return false;
+          auto *MaskC = dyn_cast<ConstantInt>(
+              AndU->getOperand(0) == BO ? AndU->getOperand(1)
+                                        : AndU->getOperand(0));
+          if (!MaskC || (MaskC->getValue() & ~SafeMask) != 0)
+            return false;
+        } else if (auto *TrU = dyn_cast<TruncInst>(LshrUser)) {
+          // trunc(lshr, M) where M <= N-k only touches safe bits.
+          if (getValueWidth(TrU) > N - k)
+            return false;
+        } else {
+          return false;
+        }
+      }
+      return true;
+    }
     default:
       return false;
     }
@@ -1539,6 +1577,74 @@ bool tryWidenAddThroughZExt(BinaryOperator &BO) {
   return trySide(0, 1) || trySide(1, 0);
 }
 
+// When the operand of a zext is structurally zero-bounded at a width NW2
+// narrower than the zext's source type NW1, we can rebuild the operand at
+// NW2 and emit a single zext from NW2 to WW instead.  Example:
+//   zext i16 (and (zext i8 a to i16), (zext i8 b to i16)) to i32
+//   => zext i8 (and i8 a, b) to i32
+// This applies whenever getStructuralNarrowWidth returns a width < source.
+bool tryShrinkZExtOfZeroBounded(ZExtInst &ZExt) {
+  Value *Src = ZExt.getOperand(0);
+  if (!isIntegerValue(&ZExt) || !isIntegerValue(Src))
+    return false;
+
+  unsigned SrcWidth = getValueWidth(Src);
+  unsigned WideWidth = getValueWidth(&ZExt);
+  assert(SrcWidth < WideWidth);
+
+  // Only apply when Src has a single use (this ZExt).  If Src has multiple
+  // ZExt users we would create duplicate narrow instructions; those cases are
+  // better handled by the component widening system which can produce a single
+  // widened value shared by all users.
+  if (!Src->hasOneUse())
+    return false;
+
+  // Determine the structural narrow width of the operand.
+  unsigned NarrowWidth = getStructuralNarrowWidth(Src);
+  if (NarrowWidth == 0 || NarrowWidth >= SrcWidth)
+    return false;
+
+  // Cost model: we add new narrow instructions (tracked in AddedValues) and
+  // one new narrow zext (NarrowWidth→WideWidth); we remove the old wide zext
+  // plus any dead intermediate instructions (tracked in RemovedInstructions).
+  // Condition: AddedValues.size() + 1 <= 1 + RemovedInstructions.size()
+  //   i.e. AddedValues.size() <= RemovedInstructions.size().
+  SmallPtrSet<Value *, 8> AddedValues;
+  SmallPtrSet<Instruction *, 8> RemovedInstructions;
+  SmallPtrSet<Value *, 8> Visited;
+  if (!collectTruncRootedValueCost(Src, NarrowWidth, AddedValues,
+                                   RemovedInstructions, Visited))
+    return false;
+  if (AddedValues.size() > RemovedInstructions.size())
+    return false;
+
+  DenseMap<Value *, Value *> Cache;
+  Value *NarrowSrc =
+      materializeTruncRootedValueAtWidth(Src, NarrowWidth, &ZExt, &Cache);
+  if (!NarrowSrc)
+    return false;
+
+  IRBuilder<> B(&ZExt);
+  Value *NewZExt;
+  if (NarrowWidth == WideWidth) {
+    NewZExt = NarrowSrc;
+  } else {
+    auto *NZ = cast<Instruction>(
+        B.CreateZExt(NarrowSrc, ZExt.getType(), ZExt.getName()));
+    NZ->setDebugLoc(ZExt.getDebugLoc());
+    NewZExt = NZ;
+  }
+
+  ZExt.replaceAllUsesWith(NewZExt);
+  ZExt.eraseFromParent();
+
+  if (auto *SI = dyn_cast<Instruction>(Src))
+    if (SI->use_empty())
+      RecursivelyDeleteTriviallyDeadInstructions(SI);
+
+  return true;
+}
+
 bool tryFoldZExtOfTruncToMask(ZExtInst &Ext) {
   auto *Tr = dyn_cast<TruncInst>(Ext.getOperand(0));
   if (!Tr)
@@ -1596,14 +1702,15 @@ bool tryFoldTruncOfExt(TruncInst &Tr) {
     return false;
 
   unsigned TargetWidth = getValueWidth(&Tr);
-  if (TargetWidth > Ext->NarrowWidth)
-    return false;
 
   Value *Replacement = nullptr;
+  IRBuilder<> B(&Tr);
+
   if (TargetWidth == Ext->NarrowWidth) {
+    // trunc(ext(a:N→W), N) = a
     Replacement = Ext->NarrowValue;
-  } else {
-    IRBuilder<> B(&Tr);
+  } else if (TargetWidth < Ext->NarrowWidth) {
+    // trunc(ext(a:N→W), M) where M < N = trunc(a, M)
     if (auto *C = dyn_cast<ConstantInt>(Ext->NarrowValue)) {
       Replacement = convertConstantToNarrow(*C, TargetWidth);
     } else {
@@ -1613,6 +1720,27 @@ bool tryFoldTruncOfExt(TruncInst &Tr) {
       NewTr->setDebugLoc(Tr.getDebugLoc());
       Replacement = NewTr;
     }
+  } else if (TargetWidth < Ext->WideWidth) {
+    // trunc(ext(a:N→W), M) where N < M < W = re-ext(a:N→M) with the same kind
+    if (auto *C = dyn_cast<ConstantInt>(Ext->NarrowValue)) {
+      // C has width NarrowWidth < TargetWidth; re-extend the APInt value.
+      APInt Extended = Ext->Kind == ExtKind::ZExt
+                           ? C->getValue().zext(TargetWidth)
+                           : C->getValue().sext(TargetWidth);
+      Replacement = ConstantInt::get(Tr.getType(), Extended);
+    } else {
+      Instruction *NewExt;
+      if (Ext->Kind == ExtKind::ZExt)
+        NewExt = cast<Instruction>(
+            B.CreateZExt(Ext->NarrowValue, Tr.getType(), Tr.getName()));
+      else
+        NewExt = cast<Instruction>(
+            B.CreateSExt(Ext->NarrowValue, Tr.getType(), Tr.getName()));
+      NewExt->setDebugLoc(Tr.getDebugLoc());
+      Replacement = NewExt;
+    }
+  } else {
+    return false; // TargetWidth >= WideWidth: not a valid narrowing trunc
   }
 
   Tr.replaceAllUsesWith(Replacement);
@@ -1695,6 +1823,29 @@ bool tryShrinkTruncOfLowBitsBinOp(TruncInst &Tr) {
       auto *AmtC = dyn_cast<ConstantInt>(BO->getOperand(1));
       if (!AmtC || AmtC->getValue().uge(TargetWidth))
         return false;
+      // Special case: trunc(lshr(sext(a:N→W), k), N) = ashr(a, k).
+      // Both lshr-of-sext and ashr-of-a agree at every bit position:
+      // positions p < N-k contain bit p+k of a (shifted bits), and positions
+      // p >= N-k contain the sign bit of a (from sext in lshr, from sign
+      // extension in ashr).  Handled directly to avoid a opcode change.
+      auto LHSInfo = getExtOperandInfo(BO->getOperand(0));
+      if (LHSInfo && LHSInfo->Kind == ExtKind::SExt &&
+          LHSInfo->NarrowWidth == TargetWidth &&
+          AmtC->getValue().ult(TargetWidth)) {
+        // Cost: remove lshr (1) and sext (if one use); add ashr (0, replaces).
+        IRBuilder<> B(&Tr);
+        auto *NarrowAmt = ConstantInt::get(
+            IntegerType::get(Tr.getContext(), TargetWidth),
+            AmtC->getValue().trunc(TargetWidth));
+        auto *NewAShr = cast<Instruction>(
+            B.CreateAShr(LHSInfo->NarrowValue, NarrowAmt, Tr.getName()));
+        NewAShr->setDebugLoc(Tr.getDebugLoc());
+        Tr.replaceAllUsesWith(NewAShr);
+        Tr.eraseFromParent();
+        if (BO->use_empty())
+          RecursivelyDeleteTriviallyDeadInstructions(BO);
+        return true;
+      }
       if (!isZeroBoundedAtWidth(BO->getOperand(0), TargetWidth))
         return false;
     } else if (BO->getOpcode() == Instruction::AShr) {
@@ -3048,6 +3199,10 @@ bool runStructuralLocalRewritesToFixpoint(Function &F) {
     for (ZExtInst *ZExt : WL.ZExts) {
       if (ZExt->getParent() == nullptr)
         continue;
+      if (tryShrinkZExtOfZeroBounded(*ZExt)) {
+        ChangedThisRound = true;
+        continue;
+      }
       ChangedThisRound |= tryFoldZExtOfTruncToMask(*ZExt);
     }
 
