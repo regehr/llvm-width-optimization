@@ -3,10 +3,10 @@
     "allow": [
 	"Bash(*)",
 	"Read(*)",
-	"llvm-lit(*)",
-	"python3(*)",
-	"opt(*)",
-	"ls(*)"
+	"Llvm-lit(*)",
+	"Python3(*)",
+	"Opt(*)",
+	"Ls(*)"
     ]
   }
 }
