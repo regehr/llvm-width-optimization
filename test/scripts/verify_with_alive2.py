@@ -87,7 +87,7 @@ def print_failure(kind: str, path: Path, proc: subprocess.CompletedProcess[str])
 
 
 def main() -> int:
-    repo_root = Path(__file__).resolve().parent.parent
+    repo_root = Path(__file__).resolve().parents[2]
 
     parser = argparse.ArgumentParser(
         description="Optimize LLVM IR tests with width-opt and validate them with Alive2."
@@ -96,7 +96,7 @@ def main() -> int:
         "--repo-root",
         type=Path,
         default=repo_root,
-        help="Repository root containing test/ and tests/ (default: script directory).",
+        help="Repository root containing test/ and tests/.",
     )
     parser.add_argument(
         "--opt-bin",

@@ -80,4 +80,4 @@ to do it.
 - Run full lit:
   - `/Users/regehr/llvm-project/for-alive/bin/llvm-lit -sv /tmp/llvm-width-optimization-build-fixpoint/test`
 - Run Alive2 script with a specific plugin:
-  - `python3 /Users/regehr/llvm-width-optimization/scripts/verify_with_alive2.py --plugin /tmp/llvm-width-optimization-build-fixpoint/lib/libWidthOpt.dylib`
+  - `python3 /Users/regehr/llvm-width-optimization/test/scripts/verify_with_alive2.py --plugin /tmp/llvm-width-optimization-build-fixpoint/lib/libWidthOpt.dylib`

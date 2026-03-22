@@ -10,6 +10,7 @@
 #include "llvm/Analysis/TargetLibraryInfo.h"
 #include "llvm/Analysis/ValueTracking.h"
 #include "llvm/IR/IRBuilder.h"
+#include "llvm/IR/ValueHandle.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/Dominators.h"
 #include "llvm/IR/DerivedTypes.h"
@@ -25,6 +26,7 @@
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/Transforms/Scalar/ADCE.h"
 #include "llvm/Transforms/Utils/Local.h"
+#include "llvm/IR/Verifier.h"
 #include <cassert>
 #include <optional>
 
@@ -929,11 +931,12 @@ bool tryWidenTruncZeroExtendedICmp(ICmpInst &Cmp, const DataLayout &DL,
     Value *NewOps[2] = {Cmp.getOperand(0), Cmp.getOperand(1)};
     NewOps[TruncIdx] = Wide;
     NewOps[1 - TruncIdx] = WideOther;
-    auto *NewCmp =
-        cast<ICmpInst>(B.CreateICmp(Cmp.getPredicate(), NewOps[0], NewOps[1]));
-    NewCmp->setDebugLoc(Cmp.getDebugLoc());
-    NewCmp->takeName(&Cmp);
-    Cmp.replaceAllUsesWith(NewCmp);
+    Value *NewCmpVal = B.CreateICmp(Cmp.getPredicate(), NewOps[0], NewOps[1]);
+    if (auto *NewCmp = dyn_cast<ICmpInst>(NewCmpVal)) {
+      NewCmp->setDebugLoc(Cmp.getDebugLoc());
+      NewCmp->takeName(&Cmp);
+    }
+    Cmp.replaceAllUsesWith(NewCmpVal);
     Cmp.eraseFromParent();
 
     if (Tr->use_empty())
@@ -1030,8 +1033,13 @@ bool tryShrinkPhiOfExts(PHINode &Phi) {
   Phi.replaceAllUsesWith(Wide);
   Phi.eraseFromParent();
 
+  // Deduplicate before calling RTDI: the same ext can appear on multiple
+  // incoming edges; erasing it once frees the memory, making subsequent
+  // accesses via the dangling pointer UB.
+  SmallPtrSet<Instruction *, 8> SeenProducers;
   for (Instruction *Producer : Info.Producers)
-    if (Producer != nullptr && Producer->use_empty())
+    if (Producer != nullptr && SeenProducers.insert(Producer).second &&
+        Producer->use_empty())
       RecursivelyDeleteTriviallyDeadInstructions(Producer);
 
   return true;
@@ -1131,9 +1139,8 @@ bool tryShrinkSelectOfExts(SelectInst &Sel) {
   Value *NarrowFV =
       FalseExt ? materializeAtWidth(B, *FalseExt, Info.NarrowWidth)
                : convertConstantToNarrow(*FalseC, Info.NarrowWidth);
-  auto *NarrowSel = cast<SelectInst>(
-      B.CreateSelect(Sel.getCondition(), NarrowTV, NarrowFV,
-                     Sel.getName() + ".narrow"));
+  Value *NarrowSel = B.CreateSelect(Sel.getCondition(), NarrowTV, NarrowFV,
+                                    Sel.getName() + ".narrow");
   SmallVector<Instruction *, 8> RemainingWideUsers;
   for (Instruction *UserI : OriginalUsers) {
     if (auto *Tr = dyn_cast<TruncInst>(UserI)) {
@@ -1151,11 +1158,11 @@ bool tryShrinkSelectOfExts(SelectInst &Sel) {
         IRBuilder<> CmpB(Cmp);
         auto *Zero = ConstantInt::get(IntegerType::get(Cmp->getContext(),
                                                        Info.NarrowWidth), 0);
-        auto *NewCmp =
-            cast<ICmpInst>(CmpB.CreateICmp(*NarrowPred, NarrowSel, Zero,
-                                           Cmp->getName()));
-        NewCmp->setDebugLoc(Cmp->getDebugLoc());
-        Cmp->replaceAllUsesWith(NewCmp);
+        Value *NewCmpVal = CmpB.CreateICmp(*NarrowPred, NarrowSel, Zero,
+                                           Cmp->getName());
+        if (auto *NewCmp = dyn_cast<ICmpInst>(NewCmpVal))
+          NewCmp->setDebugLoc(Cmp->getDebugLoc());
+        Cmp->replaceAllUsesWith(NewCmpVal);
         Cmp->eraseFromParent();
         continue;
       }
@@ -1165,12 +1172,9 @@ bool tryShrinkSelectOfExts(SelectInst &Sel) {
   }
 
   if (!RemainingWideUsers.empty()) {
-    Instruction *Wide = nullptr;
-    if (Info.Kind == ExtKind::ZExt)
-      Wide = cast<Instruction>(B.CreateZExt(NarrowSel, WideTy, Sel.getName()));
-    else
-      Wide = cast<Instruction>(B.CreateSExt(NarrowSel, WideTy, Sel.getName()));
-
+    Value *Wide = Info.Kind == ExtKind::ZExt
+                      ? B.CreateZExt(NarrowSel, WideTy, Sel.getName())
+                      : B.CreateSExt(NarrowSel, WideTy, Sel.getName());
     for (Instruction *UserI : RemainingWideUsers)
       UserI->replaceUsesOfWith(&Sel, Wide);
   }
@@ -1248,6 +1252,8 @@ bool sextUseAllowsZExt(User &U, SExtInst &Ext) {
                                                  : BO->getOperand(0))) {
         unsigned SrcWidth = getValueWidth(Ext.getOperand(0));
         unsigned WideWidth = getValueWidth(&Ext);
+        if (SrcWidth > WideWidth)
+          return false;
         APInt DemandedMask = APInt::getLowBitsSet(WideWidth, SrcWidth);
         return (Mask->getValue() & ~DemandedMask) == 0;
       }
@@ -1664,8 +1670,8 @@ bool tryFoldZExtOfTruncToMask(ZExtInst &Ext) {
   unsigned SrcWidth = getScalarIntegerWidth(Src->getType());
   unsigned NarrowWidth = getScalarIntegerWidth(Tr->getType());
   unsigned WideWidth = getScalarIntegerWidth(Ext.getType());
-  assert(NarrowWidth < WideWidth &&
-         "ZExt results must be wider than their truncated operand");
+  if (NarrowWidth >= WideWidth)
+    return false;
 
   IRBuilder<> B(&Ext);
 
@@ -1686,10 +1692,11 @@ bool tryFoldZExtOfTruncToMask(ZExtInst &Ext) {
     Masked = B.CreateZExt(Narrowed, Ext.getType());
   }
 
-  auto *NewI = cast<Instruction>(Masked);
-  NewI->setDebugLoc(Ext.getDebugLoc());
-  NewI->takeName(&Ext);
-  Ext.replaceAllUsesWith(NewI);
+  if (auto *NewI = dyn_cast<Instruction>(Masked)) {
+    NewI->setDebugLoc(Ext.getDebugLoc());
+    NewI->takeName(&Ext);
+  }
+  Ext.replaceAllUsesWith(Masked);
   Ext.eraseFromParent();
 
   if (Tr->use_empty())
@@ -1764,7 +1771,10 @@ bool tryFoldTruncOfAndMask(TruncInst &Tr) {
     return false;
 
   unsigned TargetWidth = getValueWidth(&Tr);
-  APInt FullMask = APInt::getLowBitsSet(getValueWidth(BO), TargetWidth);
+  unsigned SourceWidth = getValueWidth(BO);
+  if (TargetWidth >= SourceWidth)
+    return false;
+  APInt FullMask = APInt::getLowBitsSet(SourceWidth, TargetWidth);
 
   // Check if either operand of the AND is a constant that covers all
   // TargetWidth low bits (i.e., mask & FullMask == FullMask).
@@ -1800,8 +1810,8 @@ bool tryFoldTruncOfTrunc(TruncInst &Tr) {
   unsigned TargetWidth = getValueWidth(&Tr);
   unsigned InnerWidth = getValueWidth(Inner);
   unsigned SourceWidth = getValueWidth(Inner->getOperand(0));
-  assert(TargetWidth < InnerWidth && InnerWidth < SourceWidth &&
-         "Expected nested truncs of strictly decreasing width");
+  if (TargetWidth >= InnerWidth || InnerWidth >= SourceWidth)
+    return false;
   IRBuilder<> B(&Tr);
   auto *NewTr = cast<Instruction>(
       B.CreateTrunc(Inner->getOperand(0), Tr.getType(), Tr.getName()));
@@ -1928,9 +1938,8 @@ bool tryShrinkTruncOfLowBitsBinOp(TruncInst &Tr) {
     }
   }
   unsigned SourceWidth = getValueWidth(BO);
-  (void)SourceWidth;
-  assert(TargetWidth < SourceWidth &&
-         "Trunc results must be narrower than their source");
+  if (TargetWidth >= SourceWidth)
+    return false;
 
   // shl with a constant shift amount less than TargetWidth is low-bit
   // preserving: (a << k) mod 2^N = ((a mod 2^N) << k) mod 2^N. Requiring
@@ -2126,10 +2135,10 @@ bool tryShrinkTruncOfLowBitsBinOp(TruncInst &Tr) {
     Result = FoldedResult;
   } else {
     IRBuilder<> B(InsertPt);
-    auto *NewBO = cast<Instruction>(B.CreateBinOp(
-        (Instruction::BinaryOps)BO->getOpcode(), LHS, RHS, Tr.getName()));
-    NewBO->setDebugLoc(Tr.getDebugLoc());
-    Result = NewBO;
+    Result = B.CreateBinOp(
+        (Instruction::BinaryOps)BO->getOpcode(), LHS, RHS, Tr.getName());
+    if (auto *NewBO = dyn_cast<Instruction>(Result))
+      NewBO->setDebugLoc(Tr.getDebugLoc());
   }
 
   // Replace all trunc uses (either just Tr, or all collected multi-use truncs).
@@ -2306,10 +2315,11 @@ Value *materializeTruncRootedValueAtWidth(Value *V, unsigned TargetWidth,
       return FoldedResult;
     }
     IRBuilder<> B(InsertBefore);
-    auto *Result = cast<Instruction>(B.CreateBinOp(
+    Value *Result = B.CreateBinOp(
         (Instruction::BinaryOps)BO->getOpcode(), NarrowLHS, NarrowRHS,
-        BO->getName() + ".narrow"));
-    Result->setDebugLoc(BO->getDebugLoc());
+        BO->getName() + ".narrow");
+    if (auto *ResultI = dyn_cast<Instruction>(Result))
+      ResultI->setDebugLoc(BO->getDebugLoc());
     if (Cache && Result)
       (*Cache)[V] = Result;
     return Result;
@@ -2332,9 +2342,10 @@ Value *materializeTruncRootedValueAtWidth(Value *V, unsigned TargetWidth,
       IRBuilder<> B(InsertBefore);
       Function *NarrowFn =
           Intrinsic::getOrInsertDeclaration(II->getModule(), IID, {TargetTy});
-      auto *Result = cast<Instruction>(
-          B.CreateCall(NarrowFn, {NarrowA, NarrowB}, II->getName() + ".narrow"));
-      Result->setDebugLoc(II->getDebugLoc());
+      Value *Result =
+          B.CreateCall(NarrowFn, {NarrowA, NarrowB}, II->getName() + ".narrow");
+      if (auto *ResultI = dyn_cast<Instruction>(Result))
+        ResultI->setDebugLoc(II->getDebugLoc());
       if (Cache)
         (*Cache)[V] = Result;
       return Result;
@@ -2348,9 +2359,10 @@ Value *materializeTruncRootedValueAtWidth(Value *V, unsigned TargetWidth,
       Function *NarrowFn =
           Intrinsic::getOrInsertDeclaration(II->getModule(), Intrinsic::abs, {TargetTy});
       Value *FalseC = ConstantInt::getFalse(II->getContext());
-      auto *Result = cast<Instruction>(
-          B.CreateCall(NarrowFn, {NarrowA, FalseC}, II->getName() + ".narrow"));
-      Result->setDebugLoc(II->getDebugLoc());
+      Value *Result =
+          B.CreateCall(NarrowFn, {NarrowA, FalseC}, II->getName() + ".narrow");
+      if (auto *ResultI = dyn_cast<Instruction>(Result))
+        ResultI->setDebugLoc(II->getDebugLoc());
       if (Cache)
         (*Cache)[V] = Result;
       return Result;
@@ -2811,9 +2823,11 @@ bool tryShrinkTruncOfZeroBoundedPhi(TruncInst &Tr) {
                                     Phi->getIterator());
   NarrowPhi->setDebugLoc(Phi->getDebugLoc());
 
-  DenseMap<Value *, Value *> Cache;
   for (unsigned I = 0; I != N; ++I) {
     BasicBlock *BB = Phi->getIncomingBlock(I);
+    // Use a per-block cache so materialized values from one incoming block are
+    // not reused in a sibling block where they don't dominate.
+    DenseMap<Value *, Value *> Cache;
     Value *NarrowVal = materializeTruncRootedValueAtWidth(
         Phi->getIncomingValue(I), TargetWidth, BB->getTerminator(), &Cache);
     if (!NarrowVal) {
@@ -3621,16 +3635,20 @@ struct ExternalExtUser {
 };
 
 struct LocalRewriteWorklists {
-  SmallVector<ICmpInst *, 16> Compares;
-  SmallVector<SelectInst *, 16> Selects;
-  SmallVector<PHINode *, 16> Phis;
-  SmallVector<SExtInst *, 16> SExts;
-  SmallVector<BinaryOperator *, 16> Adds;
-  SmallVector<BinaryOperator *, 16> Ands;
-  SmallVector<BinaryOperator *, 16> UDivs;
-  SmallVector<ZExtInst *, 16> ZExts;
-  SmallVector<TruncInst *, 16> Truncs;
-  SmallVector<FreezeInst *, 16> Freezes;
+  // Instructions collected here may be erased by earlier transformations in the
+  // same round (via RecursivelyDeleteTriviallyDeadInstructions). Use
+  // WeakTrackingVH so that deleted instructions auto-null rather than leaving
+  // dangling pointers.
+  SmallVector<WeakTrackingVH, 16> Compares;
+  SmallVector<WeakTrackingVH, 16> Selects;
+  SmallVector<WeakTrackingVH, 16> Phis;
+  SmallVector<WeakTrackingVH, 16> SExts;
+  SmallVector<WeakTrackingVH, 16> Adds;
+  SmallVector<WeakTrackingVH, 16> Ands;
+  SmallVector<WeakTrackingVH, 16> UDivs;
+  SmallVector<WeakTrackingVH, 16> ZExts;
+  SmallVector<WeakTrackingVH, 16> Truncs;
+  SmallVector<WeakTrackingVH, 16> Freezes;
 };
 
 LocalRewriteWorklists collectLocalRewriteWorklists(Function &F) {
@@ -3667,20 +3685,23 @@ bool runAnalysisAwareLocalRewrites(Function &F, LazyValueInfo &LVI,
   LocalRewriteWorklists WL = collectLocalRewriteWorklists(F);
   bool Changed = false;
 
-  for (BinaryOperator *UDiv : WL.UDivs) {
-    if (UDiv->getParent() == nullptr)
+  for (WeakTrackingVH &VH : WL.UDivs) {
+    auto *UDiv = dyn_cast_or_null<BinaryOperator>(VH);
+    if (!UDiv || UDiv->getParent() == nullptr)
       continue;
     Changed |= tryNarrowUDivWithRange(*UDiv, LVI);
   }
 
-  for (SExtInst *SExt : WL.SExts) {
-    if (SExt->getParent() == nullptr)
+  for (WeakTrackingVH &VH : WL.SExts) {
+    auto *SExt = dyn_cast_or_null<SExtInst>(VH);
+    if (!SExt || SExt->getParent() == nullptr)
       continue;
     Changed |= tryConvertSExtToNonNegZExt(*SExt, LVI);
   }
 
-  for (ICmpInst *Cmp : WL.Compares) {
-    if (Cmp->getParent() == nullptr)
+  for (WeakTrackingVH &VH : WL.Compares) {
+    auto *Cmp = dyn_cast_or_null<ICmpInst>(VH);
+    if (!Cmp || Cmp->getParent() == nullptr)
       continue;
     if (tryWidenTruncEqualityICmp(*Cmp, DL, &AC, &DT)) {
       Changed = true;
@@ -3699,20 +3720,23 @@ bool runStructuralLocalRewritesToFixpoint(Function &F) {
     LocalRewriteWorklists WL = collectLocalRewriteWorklists(F);
     bool ChangedThisRound = false;
 
-    for (BinaryOperator *Add : WL.Adds) {
-      if (Add->getParent() == nullptr)
+    for (WeakTrackingVH &VH : WL.Adds) {
+      auto *Add = dyn_cast_or_null<BinaryOperator>(VH);
+      if (!Add || Add->getParent() == nullptr)
         continue;
       ChangedThisRound |= tryWidenAddThroughZExt(*Add);
     }
 
-    for (BinaryOperator *And : WL.Ands) {
-      if (And->getParent() == nullptr)
+    for (WeakTrackingVH &VH : WL.Ands) {
+      auto *And = dyn_cast_or_null<BinaryOperator>(VH);
+      if (!And || And->getParent() == nullptr)
         continue;
       ChangedThisRound |= tryFoldAndOfSExtToZExt(*And);
     }
 
-    for (ZExtInst *ZExt : WL.ZExts) {
-      if (ZExt->getParent() == nullptr)
+    for (WeakTrackingVH &VH : WL.ZExts) {
+      auto *ZExt = dyn_cast_or_null<ZExtInst>(VH);
+      if (!ZExt || ZExt->getParent() == nullptr)
         continue;
       if (tryShrinkZExtOfZeroBounded(*ZExt)) {
         ChangedThisRound = true;
@@ -3721,62 +3745,91 @@ bool runStructuralLocalRewritesToFixpoint(Function &F) {
       ChangedThisRound |= tryFoldZExtOfTruncToMask(*ZExt);
     }
 
-    for (TruncInst *Tr : WL.Truncs) {
-      if (Tr->getParent() == nullptr)
+    auto DbgVerify = [&](const char *PassName) {
+      std::string Err;
+      raw_string_ostream OS(Err);
+      if (verifyFunction(F, &OS)) {
+        errs() << "VERIFY FAILED after " << PassName << ":\n" << Err << "\n";
+        for (auto &BB : F) {
+          errs() << BB.getName() << ":\n";
+          for (auto &I : BB)
+            errs() << "  " << I << "\n";
+        }
+        llvm_unreachable("IR broken");
+      }
+    };
+    for (WeakTrackingVH &VH : WL.Truncs) {
+      auto *Tr = dyn_cast_or_null<TruncInst>(VH);
+      if (!Tr || Tr->getParent() == nullptr)
         continue;
       if (tryFoldTruncOfExt(*Tr)) {
+        DbgVerify("tryFoldTruncOfExt");
         ChangedThisRound = true;
         continue;
       }
       if (tryFoldTruncOfAndMask(*Tr)) {
+        DbgVerify("tryFoldTruncOfAndMask");
         ChangedThisRound = true;
         continue;
       }
       if (tryFoldTruncOfTrunc(*Tr)) {
+        DbgVerify("tryFoldTruncOfTrunc");
         ChangedThisRound = true;
         continue;
       }
       if (tryFoldTruncOfCtpop(*Tr)) {
+        DbgVerify("tryFoldTruncOfCtpop");
         ChangedThisRound = true;
         continue;
       }
       if (tryShrinkTruncOfShiftRecurrence(*Tr)) {
+        DbgVerify("tryShrinkTruncOfShiftRecurrence");
         ChangedThisRound = true;
         continue;
       }
       if (tryShrinkTruncOfLowBitsRecurrence(*Tr)) {
+        DbgVerify("tryShrinkTruncOfLowBitsRecurrence");
         ChangedThisRound = true;
         continue;
       }
       if (tryShrinkTruncOfSelect(*Tr)) {
+        DbgVerify("tryShrinkTruncOfSelect");
         ChangedThisRound = true;
         continue;
       }
       if (tryShrinkTruncOfZeroBoundedPhi(*Tr)) {
+        DbgVerify("tryShrinkTruncOfZeroBoundedPhi");
         ChangedThisRound = true;
         continue;
       }
       if (tryShrinkTruncOfMinMaxAbs(*Tr)) {
+        DbgVerify("tryShrinkTruncOfMinMaxAbs");
         ChangedThisRound = true;
         continue;
       }
-      ChangedThisRound |= tryShrinkTruncOfLowBitsBinOp(*Tr);
+      if (tryShrinkTruncOfLowBitsBinOp(*Tr)) {
+        DbgVerify("tryShrinkTruncOfLowBitsBinOp");
+        ChangedThisRound = true;
+      }
     }
 
-    for (SExtInst *SExt : WL.SExts) {
-      if (SExt->getParent() == nullptr)
+    for (WeakTrackingVH &VH : WL.SExts) {
+      auto *SExt = dyn_cast_or_null<SExtInst>(VH);
+      if (!SExt || SExt->getParent() == nullptr)
         continue;
       ChangedThisRound |= tryConvertWholeSExtToZExt(*SExt);
     }
 
-    for (FreezeInst *FI : WL.Freezes) {
-      if (FI->getParent() == nullptr)
+    for (WeakTrackingVH &VH : WL.Freezes) {
+      auto *FI = dyn_cast_or_null<FreezeInst>(VH);
+      if (!FI || FI->getParent() == nullptr)
         continue;
       ChangedThisRound |= tryPushFreezeThroughExt(*FI);
     }
 
-    for (ICmpInst *Cmp : WL.Compares) {
-      if (Cmp->getParent() == nullptr)
+    for (WeakTrackingVH &VH : WL.Compares) {
+      auto *Cmp = dyn_cast_or_null<ICmpInst>(VH);
+      if (!Cmp || Cmp->getParent() == nullptr)
         continue;
       if (tryShrinkICmp(*Cmp)) {
         ChangedThisRound = true;
@@ -3789,14 +3842,16 @@ bool runStructuralLocalRewritesToFixpoint(Function &F) {
       ChangedThisRound |= tryShrinkICmpZeroBounded(*Cmp);
     }
 
-    for (SelectInst *Sel : WL.Selects) {
-      if (Sel->getParent() == nullptr)
+    for (WeakTrackingVH &VH : WL.Selects) {
+      auto *Sel = dyn_cast_or_null<SelectInst>(VH);
+      if (!Sel || Sel->getParent() == nullptr)
         continue;
       ChangedThisRound |= tryShrinkSelectOfExts(*Sel);
     }
 
-    for (PHINode *Phi : WL.Phis) {
-      if (Phi->getParent() == nullptr)
+    for (WeakTrackingVH &VH : WL.Phis) {
+      auto *Phi = dyn_cast_or_null<PHINode>(VH);
+      if (!Phi || Phi->getParent() == nullptr)
         continue;
       ChangedThisRound |= tryShrinkPhiOfExts(*Phi);
     }
@@ -4228,12 +4283,13 @@ bool tryWidenComponentFromPlan(const Component &C, const AnalysisResult &R,
           continue;
 
         IRBuilder<> B(BO);
-        auto *WideBO = cast<Instruction>(
-            B.CreateBinOp((Instruction::BinaryOps)BO->getOpcode(), WideLHS,
-                          WideRHS));
-        WideBO->setDebugLoc(BO->getDebugLoc());
-        WideBO->takeName(BO);
-        NewValues[BO] = WideBO;
+        Value *WideBOVal = B.CreateBinOp((Instruction::BinaryOps)BO->getOpcode(),
+                                         WideLHS, WideRHS);
+        if (auto *WideBO = dyn_cast<Instruction>(WideBOVal)) {
+          WideBO->setDebugLoc(BO->getDebugLoc());
+          WideBO->takeName(BO);
+        }
+        NewValues[BO] = WideBOVal;
         Progress = true;
         --Remaining;
         continue;

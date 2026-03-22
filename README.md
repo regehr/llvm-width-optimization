@@ -121,8 +121,9 @@ search space.
 
 - `include/`, `lib/`: plugin source
 - `test/`: lit regression tests for this plugin
-- `scripts/verify_with_alive2.py`: optimize each `.ll` test with `width-opt`
-  and check correctness with Alive2
+- `test/scripts/`: test harnesses for lit, smoke, and Alive2 validation
+- `scripts/`: standalone analysis helpers such as precision and instruction
+  count comparison utilities
 - `width-minimization-design.md`: design document
 
 All maintained regression cases now live under `test/`.
@@ -191,7 +192,7 @@ Run Alive2 over all `.ll` files under `test/` after optimizing them with
 `width-opt`:
 
 ```bash
-python3 /Users/regehr/llvm-width-optimization/scripts/verify_with_alive2.py
+python3 /Users/regehr/llvm-width-optimization/test/scripts/verify_with_alive2.py
 ```
 
 By default, the script uses:
@@ -208,7 +209,7 @@ for cases that Alive2 cannot currently model, such as unsupported EH forms.
 Verbose mode prints the source and optimized IR text for each file:
 
 ```bash
-python3 /Users/regehr/llvm-width-optimization/scripts/verify_with_alive2.py \
+python3 /Users/regehr/llvm-width-optimization/test/scripts/verify_with_alive2.py \
   --verbose
 ```
 

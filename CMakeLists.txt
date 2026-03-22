@@ -83,12 +83,12 @@ add_custom_target(
   check
   COMMAND
     "${Python3_EXECUTABLE}"
-    "${PROJECT_SOURCE_DIR}/scripts/run_lit.py"
+    "${PROJECT_SOURCE_DIR}/test/scripts/run_lit.py"
     --llvm-lit "${WO_LLVM_LIT}"
     "${PROJECT_BINARY_DIR}/test"
   COMMAND
     "${Python3_EXECUTABLE}"
-    "${PROJECT_SOURCE_DIR}/scripts/run_width_opt_smoke.py"
+    "${PROJECT_SOURCE_DIR}/test/scripts/run_width_opt_smoke.py"
     --repo-root "${PROJECT_SOURCE_DIR}"
     --opt-bin "${WO_LLVM_OPT}"
     --plugin "$<TARGET_FILE:WidthOpt>"

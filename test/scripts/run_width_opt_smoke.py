@@ -108,7 +108,7 @@ def run_test(
 
 
 def main() -> int:
-    repo_root = Path(__file__).resolve().parent.parent
+    repo_root = Path(__file__).resolve().parents[2]
     default_plugin = find_default_plugin(repo_root)
 
     parser = argparse.ArgumentParser(
