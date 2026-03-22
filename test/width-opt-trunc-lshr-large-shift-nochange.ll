@@ -1,8 +1,9 @@
 ; RUN: opt -load-pass-plugin %shlibdir/libWidthOpt%shlibext \
 ; RUN:   -passes='width-opt' -S %s | FileCheck %s
 
-; A shift amount >= the target width would make the narrow lshr poison, so
-; this must not be transformed.
+; lshr of a zero-bounded value (zext i8→i32) by a shift amount >= 8 shifts
+; out all value bits and yields 0.  We fold to the constant directly rather
+; than emitting a narrow lshr (which would be poison for shift >= bitwidth).
 
 define i8 @lshr_shift_too_large(i8 %x) {
   %wide = zext i8 %x to i32
@@ -12,6 +13,7 @@ define i8 @lshr_shift_too_large(i8 %x) {
 }
 
 ; CHECK-LABEL: define i8 @lshr_shift_too_large(
-; CHECK: zext
-; CHECK: lshr
-; CHECK: trunc
+; CHECK-NOT: zext
+; CHECK-NOT: lshr
+; CHECK-NOT: trunc
+; CHECK: ret i8 0

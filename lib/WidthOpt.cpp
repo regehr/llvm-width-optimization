@@ -1352,8 +1352,9 @@ struct NarrowUDivResultPlan {
 };
 
 bool tryNarrowUDivWithRange(BinaryOperator &BO, LazyValueInfo &LVI) {
-  assert(BO.getOpcode() == Instruction::UDiv &&
-         "UDiv narrowing expects a udiv instruction");
+  assert((BO.getOpcode() == Instruction::UDiv ||
+          BO.getOpcode() == Instruction::URem) &&
+         "UDiv/URem narrowing expects a udiv or urem instruction");
   if (!isIntegerValue(&BO) || !isIntegerValue(BO.getOperand(0)) ||
       !isIntegerValue(BO.getOperand(1)))
     return false;
@@ -1468,11 +1469,12 @@ bool tryNarrowUDivWithRange(BinaryOperator &BO, LazyValueInfo &LVI) {
 
   Value *NarrowLHS = materializeOperand(*LHSPlan, BO.getName() + ".lhs.narrow");
   Value *NarrowRHS = materializeOperand(*RHSPlan, BO.getName() + ".rhs.narrow");
-  auto *NarrowDiv = cast<Instruction>(
-      B.CreateUDiv(NarrowLHS, NarrowRHS, BO.getName() + ".narrow"));
+  auto *NarrowDiv = cast<Instruction>(B.CreateBinOp(
+      (Instruction::BinaryOps)BO.getOpcode(), NarrowLHS, NarrowRHS,
+      BO.getName() + ".narrow"));
   NarrowDiv->setDebugLoc(BO.getDebugLoc());
-  if (BO.isExact())
-    NarrowDiv->setIsExact(true);
+  if (BO.getOpcode() == Instruction::UDiv && BO.isExact())
+    cast<BinaryOperator>(NarrowDiv)->setIsExact(true);
 
   if (ResultPlan.TruncUser != nullptr) {
     ResultPlan.TruncUser->replaceAllUsesWith(NarrowDiv);
@@ -1752,6 +1754,101 @@ bool tryFoldTruncOfExt(TruncInst &Tr) {
   return true;
 }
 
+// trunc(and(x, mask), N) → trunc(x, N) when mask has all N low bits set.
+// The AND cannot affect the bits that survive the truncation, so it is dead.
+bool tryFoldTruncOfAndMask(TruncInst &Tr) {
+  auto *BO = dyn_cast<BinaryOperator>(Tr.getOperand(0));
+  if (!BO || BO->getOpcode() != Instruction::And || !BO->hasOneUse())
+    return false;
+  if (!isIntegerValue(&Tr) || !isIntegerValue(BO))
+    return false;
+
+  unsigned TargetWidth = getValueWidth(&Tr);
+  APInt FullMask = APInt::getLowBitsSet(getValueWidth(BO), TargetWidth);
+
+  // Check if either operand of the AND is a constant that covers all
+  // TargetWidth low bits (i.e., mask & FullMask == FullMask).
+  Value *Other = nullptr;
+  for (unsigned I = 0; I < 2; ++I) {
+    if (auto *C = dyn_cast<ConstantInt>(BO->getOperand(I))) {
+      if ((C->getValue() & FullMask) == FullMask) {
+        Other = BO->getOperand(1 - I);
+        break;
+      }
+    }
+  }
+  if (!Other)
+    return false;
+
+  IRBuilder<> B(&Tr);
+  Value *NewTr = B.CreateTrunc(Other, Tr.getType(), Tr.getName());
+  if (auto *I = dyn_cast<Instruction>(NewTr))
+    I->setDebugLoc(Tr.getDebugLoc());
+  Tr.replaceAllUsesWith(NewTr);
+  Tr.eraseFromParent();
+  if (BO->use_empty())
+    RecursivelyDeleteTriviallyDeadInstructions(BO);
+  return true;
+}
+
+// Fold trunc(trunc(a:W→M), N) → trunc(a:W→N) when N < M < W.
+// Adjacent truncs of the same underlying value can always be merged.
+bool tryFoldTruncOfTrunc(TruncInst &Tr) {
+  auto *Inner = dyn_cast<TruncInst>(Tr.getOperand(0));
+  if (!Inner || !isIntegerValue(&Tr) || !isIntegerValue(Inner))
+    return false;
+  unsigned TargetWidth = getValueWidth(&Tr);
+  unsigned InnerWidth = getValueWidth(Inner);
+  unsigned SourceWidth = getValueWidth(Inner->getOperand(0));
+  assert(TargetWidth < InnerWidth && InnerWidth < SourceWidth &&
+         "Expected nested truncs of strictly decreasing width");
+  IRBuilder<> B(&Tr);
+  auto *NewTr = cast<Instruction>(
+      B.CreateTrunc(Inner->getOperand(0), Tr.getType(), Tr.getName()));
+  NewTr->setDebugLoc(Tr.getDebugLoc());
+  Tr.replaceAllUsesWith(NewTr);
+  Tr.eraseFromParent();
+  if (Inner->use_empty())
+    RecursivelyDeleteTriviallyDeadInstructions(Inner);
+  return true;
+}
+
+// trunc(ctpop(zext(a:N→W)), N) = ctpop(a:N)
+// because zext does not add any set bits so ctpop of the zext equals ctpop
+// of the original value, and ctpop(a:N) <= N which always fits in N bits.
+bool tryFoldTruncOfCtpop(TruncInst &Tr) {
+  auto *II = dyn_cast<IntrinsicInst>(Tr.getOperand(0));
+  if (!II || !II->hasOneUse())
+    return false;
+  if (II->getIntrinsicID() != Intrinsic::ctpop)
+    return false;
+  if (!isIntegerValue(&Tr) || !isIntegerValue(II))
+    return false;
+
+  unsigned TargetWidth = getValueWidth(&Tr);
+  // The ctpop argument must be a zero-extension from exactly TargetWidth bits.
+  // We could also accept any zext from <= TargetWidth bits, but that would
+  // require a narrower ctpop followed by zext; keep it simple.
+  auto Ext = getExtOperandInfo(II->getArgOperand(0));
+  if (!Ext || Ext->Kind != ExtKind::ZExt || Ext->NarrowWidth != TargetWidth)
+    return false;
+
+  // ctpop(zext(a:N→W)) fits in N bits (result <= N), so we can compute
+  // ctpop at the narrow width and return that directly.
+  auto *NarrowTy = IntegerType::get(Tr.getContext(), TargetWidth);
+  IRBuilder<> B(&Tr);
+  Function *NarrowCtpop = Intrinsic::getOrInsertDeclaration(
+      II->getModule(), Intrinsic::ctpop, {NarrowTy});
+  auto *Result = cast<Instruction>(
+      B.CreateCall(NarrowCtpop, {Ext->NarrowValue}, Tr.getName()));
+  Result->setDebugLoc(Tr.getDebugLoc());
+  Tr.replaceAllUsesWith(Result);
+  Tr.eraseFromParent();
+  if (II->use_empty())
+    RecursivelyDeleteTriviallyDeadInstructions(II);
+  return true;
+}
+
 // Returns true if V is provably zero in all bit positions >= Width.
 // This is a conservative structural check: it covers direct zero-extensions,
 // bitwise operations (and/or/xor) of zero-bounded operands, lshr of a
@@ -1776,6 +1873,23 @@ bool isZeroBoundedAtWidth(Value *V, unsigned Width) {
         BO->getOpcode() == Instruction::Xor)
       return isZeroBoundedAtWidth(BO->getOperand(0), Width) &&
              isZeroBoundedAtWidth(BO->getOperand(1), Width);
+    // udiv result <= dividend, so bounded if dividend is bounded.
+    if (BO->getOpcode() == Instruction::UDiv)
+      return isZeroBoundedAtWidth(BO->getOperand(0), Width);
+    // urem result < divisor and <= dividend, so bounded if either is bounded.
+    if (BO->getOpcode() == Instruction::URem)
+      return isZeroBoundedAtWidth(BO->getOperand(0), Width) ||
+             isZeroBoundedAtWidth(BO->getOperand(1), Width);
+  }
+  // umin result <= both operands; bounded if either operand is bounded.
+  // umax result = one of the operands; bounded if both operands are bounded.
+  if (auto *II = dyn_cast<IntrinsicInst>(V)) {
+    if (II->getIntrinsicID() == Intrinsic::umin)
+      return isZeroBoundedAtWidth(II->getArgOperand(0), Width) ||
+             isZeroBoundedAtWidth(II->getArgOperand(1), Width);
+    if (II->getIntrinsicID() == Intrinsic::umax)
+      return isZeroBoundedAtWidth(II->getArgOperand(0), Width) &&
+             isZeroBoundedAtWidth(II->getArgOperand(1), Width);
   }
   return false;
 }
@@ -1794,13 +1908,25 @@ bool collectTruncRootedValueCost(
 
 bool tryShrinkTruncOfLowBitsBinOp(TruncInst &Tr) {
   auto *BO = dyn_cast<BinaryOperator>(Tr.getOperand(0));
-  if (!BO || !BO->hasOneUse())
+  if (!BO)
     return false;
   if (!isIntegerValue(&Tr) || !isIntegerValue(BO) ||
       !isIntegerValue(BO->getOperand(0)) || !isIntegerValue(BO->getOperand(1)))
     return false;
 
   unsigned TargetWidth = getValueWidth(&Tr);
+
+  // Allow multi-use BOs when all uses are truncs to the same target width.
+  // In that case we narrow the BO once and replace all trunc uses together.
+  SmallVector<TruncInst *, 4> AllTruncUses;
+  if (!BO->hasOneUse()) {
+    for (User *U : BO->users()) {
+      auto *T = dyn_cast<TruncInst>(U);
+      if (!T || getValueWidth(T) != TargetWidth)
+        return false;
+      AllTruncUses.push_back(T);
+    }
+  }
   unsigned SourceWidth = getValueWidth(BO);
   (void)SourceWidth;
   assert(TargetWidth < SourceWidth &&
@@ -1821,30 +1947,59 @@ bool tryShrinkTruncOfLowBitsBinOp(TruncInst &Tr) {
         return false;
     } else if (BO->getOpcode() == Instruction::LShr) {
       auto *AmtC = dyn_cast<ConstantInt>(BO->getOperand(1));
-      if (!AmtC || AmtC->getValue().uge(TargetWidth))
+      if (!AmtC)
         return false;
-      // Special case: trunc(lshr(sext(a:N→W), k), N) = ashr(a, k).
-      // Both lshr-of-sext and ashr-of-a agree at every bit position:
-      // positions p < N-k contain bit p+k of a (shifted bits), and positions
-      // p >= N-k contain the sign bit of a (from sext in lshr, from sign
-      // extension in ashr).  Handled directly to avoid a opcode change.
-      auto LHSInfo = getExtOperandInfo(BO->getOperand(0));
-      if (LHSInfo && LHSInfo->Kind == ExtKind::SExt &&
-          LHSInfo->NarrowWidth == TargetWidth &&
-          AmtC->getValue().ult(TargetWidth)) {
-        // Cost: remove lshr (1) and sext (if one use); add ashr (0, replaces).
-        IRBuilder<> B(&Tr);
-        auto *NarrowAmt = ConstantInt::get(
-            IntegerType::get(Tr.getContext(), TargetWidth),
-            AmtC->getValue().trunc(TargetWidth));
-        auto *NewAShr = cast<Instruction>(
-            B.CreateAShr(LHSInfo->NarrowValue, NarrowAmt, Tr.getName()));
-        NewAShr->setDebugLoc(Tr.getDebugLoc());
-        Tr.replaceAllUsesWith(NewAShr);
+      // lshr of a zero-bounded value by >= TargetWidth bits shifts out all
+      // the value bits, producing 0.
+      if (AmtC->getValue().uge(TargetWidth)) {
+        if (!isZeroBoundedAtWidth(BO->getOperand(0), TargetWidth))
+          return false;
+        Value *Zero = ConstantInt::get(Tr.getType(), 0);
+        Tr.replaceAllUsesWith(Zero);
         Tr.eraseFromParent();
         if (BO->use_empty())
           RecursivelyDeleteTriviallyDeadInstructions(BO);
         return true;
+      }
+      // Special case: trunc(lshr*(sext(a:N→W), k_total), N) = ashr(a, k_total)
+      // where lshr* denotes a chain of one or more lshrs with constant amounts
+      // summing to k_total < N.  At every bit position p of the result:
+      //   p < N-k_total : bit p+k_total of a (shifted bits)
+      //   p >= N-k_total: sign bit of a (sext fills above N; ashr sign-extends)
+      // Walk the lshr chain (each must have a single use) to find the sext.
+      {
+        uint64_t TotalShift = AmtC->getValue().getZExtValue();
+        Value *LshrChainBase = BO->getOperand(0);
+        SmallVector<BinaryOperator *, 4> ChainLinks; // inner lshrs, not BO
+        while (auto *Inner = dyn_cast<BinaryOperator>(LshrChainBase)) {
+          if (Inner->getOpcode() != Instruction::LShr || !Inner->hasOneUse())
+            break;
+          auto *InnerAmt = dyn_cast<ConstantInt>(Inner->getOperand(1));
+          if (!InnerAmt)
+            break;
+          TotalShift += InnerAmt->getValue().getZExtValue();
+          if (TotalShift >= TargetWidth)
+            break; // overflow: can't produce valid ashr
+          ChainLinks.push_back(Inner);
+          LshrChainBase = Inner->getOperand(0);
+        }
+        auto LHSInfo = getExtOperandInfo(LshrChainBase);
+        if (LHSInfo && LHSInfo->Kind == ExtKind::SExt &&
+            LHSInfo->NarrowWidth == TargetWidth &&
+            TotalShift < TargetWidth) {
+          IRBuilder<> B(&Tr);
+          auto *NarrowAmt = ConstantInt::get(
+              IntegerType::get(Tr.getContext(), TargetWidth), TotalShift);
+          auto *NewAShr = cast<Instruction>(
+              B.CreateAShr(LHSInfo->NarrowValue, NarrowAmt, Tr.getName()));
+          NewAShr->setDebugLoc(Tr.getDebugLoc());
+          Tr.replaceAllUsesWith(NewAShr);
+          Tr.eraseFromParent();
+          // Clean up the lshr chain bottom-up.
+          if (BO->use_empty())
+            RecursivelyDeleteTriviallyDeadInstructions(BO);
+          return true;
+        }
       }
       if (!isZeroBoundedAtWidth(BO->getOperand(0), TargetWidth))
         return false;
@@ -1856,6 +2011,41 @@ bool tryShrinkTruncOfLowBitsBinOp(TruncInst &Tr) {
       auto *AmtC = dyn_cast<ConstantInt>(BO->getOperand(1));
       if (!AmtC || AmtC->getValue().uge(TargetWidth))
         return false;
+      // Walk a chain of single-use constant ashrs to find the sext root.
+      // trunc(ashr(ashr(sext(a:N→W), k1), k2), N) = ashr(a, k1+k2).
+      {
+        uint64_t TotalShift = AmtC->getValue().getZExtValue();
+        Value *AshrChainBase = BO->getOperand(0);
+        SmallVector<BinaryOperator *, 4> ChainLinks;
+        while (auto *Inner = dyn_cast<BinaryOperator>(AshrChainBase)) {
+          if (Inner->getOpcode() != Instruction::AShr || !Inner->hasOneUse())
+            break;
+          auto *InnerAmt = dyn_cast<ConstantInt>(Inner->getOperand(1));
+          if (!InnerAmt)
+            break;
+          TotalShift += InnerAmt->getValue().getZExtValue();
+          if (TotalShift >= TargetWidth)
+            break;
+          ChainLinks.push_back(Inner);
+          AshrChainBase = Inner->getOperand(0);
+        }
+        auto LHSInfo = getExtOperandInfo(AshrChainBase);
+        if (LHSInfo && LHSInfo->Kind == ExtKind::SExt &&
+            LHSInfo->NarrowWidth == TargetWidth &&
+            TotalShift < TargetWidth) {
+          IRBuilder<> B(&Tr);
+          auto *NarrowAmt = ConstantInt::get(
+              IntegerType::get(Tr.getContext(), TargetWidth), TotalShift);
+          auto *NewAShr = cast<Instruction>(
+              B.CreateAShr(LHSInfo->NarrowValue, NarrowAmt, Tr.getName()));
+          NewAShr->setDebugLoc(Tr.getDebugLoc());
+          Tr.replaceAllUsesWith(NewAShr);
+          Tr.eraseFromParent();
+          if (BO->use_empty())
+            RecursivelyDeleteTriviallyDeadInstructions(BO);
+          return true;
+        }
+      }
       auto LHSInfo = getExtOperandInfo(BO->getOperand(0));
       if (!LHSInfo || LHSInfo->Kind != ExtKind::SExt ||
           LHSInfo->NarrowWidth > TargetWidth)
@@ -1882,22 +2072,76 @@ bool tryShrinkTruncOfLowBitsBinOp(TruncInst &Tr) {
   if (AddedInstructionCost > RemovedInstructionCost)
     return false;
 
+  // For multi-use case insert right after the BO (dominates all its users).
+  // For single-use case insert before Tr (the only user) as before.
+  Instruction *InsertPt =
+      AllTruncUses.empty() ? &Tr : BO->getNextNode();
+
   DenseMap<Value *, Value *> Cache;
   Value *LHS =
-      materializeTruncRootedValueAtWidth(BO->getOperand(0), TargetWidth, &Tr,
-                                         &Cache);
+      materializeTruncRootedValueAtWidth(BO->getOperand(0), TargetWidth,
+                                         InsertPt, &Cache);
   Value *RHS =
-      materializeTruncRootedValueAtWidth(BO->getOperand(1), TargetWidth, &Tr,
-                                         &Cache);
+      materializeTruncRootedValueAtWidth(BO->getOperand(1), TargetWidth,
+                                         InsertPt, &Cache);
   if (!LHS || !RHS)
     return false;
 
-  IRBuilder<> B(&Tr);
-  auto *NewBO = cast<Instruction>(B.CreateBinOp(
-      (Instruction::BinaryOps)BO->getOpcode(), LHS, RHS, Tr.getName()));
-  NewBO->setDebugLoc(Tr.getDebugLoc());
-  Tr.replaceAllUsesWith(NewBO);
-  Tr.eraseFromParent();
+  // Check for identity operations before emitting the narrow binop.
+  auto *LHSC = dyn_cast<ConstantInt>(LHS);
+  auto *RHSC = dyn_cast<ConstantInt>(RHS);
+  Value *FoldedResult = nullptr;
+  unsigned Opc = BO->getOpcode();
+  if (Opc == Instruction::And) {
+    if (RHSC && RHSC->getValue().isAllOnes()) FoldedResult = LHS;
+    else if (LHSC && LHSC->getValue().isAllOnes()) FoldedResult = RHS;
+    else if ((LHSC && LHSC->isZero()) || (RHSC && RHSC->isZero()))
+      FoldedResult = ConstantInt::get(LHS->getType(), 0);
+  } else if (Opc == Instruction::Or) {
+    if (RHSC && RHSC->isZero()) FoldedResult = LHS;
+    else if (LHSC && LHSC->isZero()) FoldedResult = RHS;
+    else if ((LHSC && LHSC->getValue().isAllOnes()) ||
+             (RHSC && RHSC->getValue().isAllOnes()))
+      FoldedResult = ConstantInt::get(LHS->getType(), APInt::getAllOnes(TargetWidth));
+  } else if (Opc == Instruction::Xor) {
+    if (RHSC && RHSC->isZero()) FoldedResult = LHS;
+    else if (LHSC && LHSC->isZero()) FoldedResult = RHS;
+  } else if (Opc == Instruction::Add) {
+    if (RHSC && RHSC->isZero()) FoldedResult = LHS;
+    else if (LHSC && LHSC->isZero()) FoldedResult = RHS;
+  } else if (Opc == Instruction::Sub) {
+    if (RHSC && RHSC->isZero()) FoldedResult = LHS;
+  } else if (Opc == Instruction::Mul) {
+    if (RHSC && RHSC->isOne()) FoldedResult = LHS;
+    else if (LHSC && LHSC->isOne()) FoldedResult = RHS;
+    else if ((LHSC && LHSC->isZero()) || (RHSC && RHSC->isZero()))
+      FoldedResult = ConstantInt::get(LHS->getType(), 0);
+  } else if (Opc == Instruction::Shl || Opc == Instruction::LShr ||
+             Opc == Instruction::AShr) {
+    if (RHSC && RHSC->isZero()) FoldedResult = LHS;
+  }
+
+  Value *Result;
+  if (FoldedResult) {
+    Result = FoldedResult;
+  } else {
+    IRBuilder<> B(InsertPt);
+    auto *NewBO = cast<Instruction>(B.CreateBinOp(
+        (Instruction::BinaryOps)BO->getOpcode(), LHS, RHS, Tr.getName()));
+    NewBO->setDebugLoc(Tr.getDebugLoc());
+    Result = NewBO;
+  }
+
+  // Replace all trunc uses (either just Tr, or all collected multi-use truncs).
+  if (AllTruncUses.empty()) {
+    Tr.replaceAllUsesWith(Result);
+    Tr.eraseFromParent();
+  } else {
+    for (TruncInst *T : AllTruncUses) {
+      T->replaceAllUsesWith(Result);
+      T->eraseFromParent();
+    }
+  }
 
   if (BO->use_empty())
     RecursivelyDeleteTriviallyDeadInstructions(BO);
@@ -1941,8 +2185,18 @@ Value *materializeTruncRootedValueAtWidth(Value *V, unsigned TargetWidth,
   }
 
   if (auto Ext = getExtOperandInfo(V)) {
-    if (TargetWidth < Ext->NarrowWidth || TargetWidth > Ext->WideWidth)
+    if (TargetWidth > Ext->WideWidth)
       return nullptr;
+    if (TargetWidth < Ext->NarrowWidth) {
+      // Transitive chain: e.g. trunc(sext(sext(a:i8→i16)→i32), i8).
+      // Recurse into the extension's source to narrow it further.
+      Value *Result = materializeTruncRootedValueAtWidth(Ext->NarrowValue,
+                                                         TargetWidth,
+                                                         InsertBefore, Cache);
+      if (Cache && Result)
+        (*Cache)[V] = Result;
+      return Result;
+    }
     IRBuilder<> B(InsertBefore);
     Value *Result = materializeAtWidth(B, *Ext, TargetWidth);
     if (Cache && Result)
@@ -1966,8 +2220,17 @@ Value *materializeTruncRootedValueAtWidth(Value *V, unsigned TargetWidth,
           return nullptr;
       } else if (BO->getOpcode() == Instruction::LShr) {
         auto *AmtC = dyn_cast<ConstantInt>(BO->getOperand(1));
-        if (!AmtC || AmtC->getValue().uge(TargetWidth))
+        if (!AmtC)
           return nullptr;
+        if (AmtC->getValue().uge(TargetWidth)) {
+          // lshr of a zero-bounded value by >= TargetWidth bits is 0.
+          if (!isZeroBoundedAtWidth(BO->getOperand(0), TargetWidth))
+            return nullptr;
+          Value *Zero = ConstantInt::get(TargetTy, 0);
+          if (Cache)
+            (*Cache)[V] = Zero;
+          return Zero;
+        }
         if (!isZeroBoundedAtWidth(BO->getOperand(0), TargetWidth))
           return nullptr;
       } else if (BO->getOpcode() == Instruction::AShr) {
@@ -1977,6 +2240,11 @@ Value *materializeTruncRootedValueAtWidth(Value *V, unsigned TargetWidth,
         auto LHSInfo = getExtOperandInfo(BO->getOperand(0));
         if (!LHSInfo || LHSInfo->Kind != ExtKind::SExt ||
             LHSInfo->NarrowWidth > TargetWidth)
+          return nullptr;
+      } else if (BO->getOpcode() == Instruction::UDiv ||
+                 BO->getOpcode() == Instruction::URem) {
+        if (!isZeroBoundedAtWidth(BO->getOperand(0), TargetWidth) ||
+            !isZeroBoundedAtWidth(BO->getOperand(1), TargetWidth))
           return nullptr;
       } else {
         return nullptr;
@@ -1990,6 +2258,53 @@ Value *materializeTruncRootedValueAtWidth(Value *V, unsigned TargetWidth,
                                            InsertBefore, Cache);
     if (!NarrowLHS || !NarrowRHS)
       return nullptr;
+    // Fold identity cases before emitting the narrow instruction.
+    auto AllOnes = [&](Value *V) -> bool {
+      auto *C = dyn_cast<ConstantInt>(V);
+      return C && C->getValue().isAllOnes();
+    };
+    auto IsZero = [&](Value *V) -> bool {
+      auto *C = dyn_cast<ConstantInt>(V);
+      return C && C->isZero();
+    };
+    auto IsOne = [&](Value *V) -> bool {
+      auto *C = dyn_cast<ConstantInt>(V);
+      return C && C->isOne();
+    };
+    Value *FoldedResult = nullptr;
+    unsigned Opc = BO->getOpcode();
+    if (Opc == Instruction::And) {
+      if (AllOnes(NarrowRHS)) FoldedResult = NarrowLHS;
+      else if (AllOnes(NarrowLHS)) FoldedResult = NarrowRHS;
+      else if (IsZero(NarrowLHS) || IsZero(NarrowRHS))
+        FoldedResult = ConstantInt::get(NarrowLHS->getType(), 0);
+    } else if (Opc == Instruction::Or) {
+      if (IsZero(NarrowRHS)) FoldedResult = NarrowLHS;
+      else if (IsZero(NarrowLHS)) FoldedResult = NarrowRHS;
+      else if (AllOnes(NarrowLHS) || AllOnes(NarrowRHS))
+        FoldedResult = ConstantInt::get(NarrowLHS->getType(), APInt::getAllOnes(TargetWidth));
+    } else if (Opc == Instruction::Xor) {
+      if (IsZero(NarrowRHS)) FoldedResult = NarrowLHS;
+      else if (IsZero(NarrowLHS)) FoldedResult = NarrowRHS;
+    } else if (Opc == Instruction::Add) {
+      if (IsZero(NarrowRHS)) FoldedResult = NarrowLHS;
+      else if (IsZero(NarrowLHS)) FoldedResult = NarrowRHS;
+    } else if (Opc == Instruction::Sub) {
+      if (IsZero(NarrowRHS)) FoldedResult = NarrowLHS;
+    } else if (Opc == Instruction::Mul) {
+      if (IsOne(NarrowRHS)) FoldedResult = NarrowLHS;
+      else if (IsOne(NarrowLHS)) FoldedResult = NarrowRHS;
+      else if (IsZero(NarrowLHS) || IsZero(NarrowRHS))
+        FoldedResult = ConstantInt::get(NarrowLHS->getType(), 0);
+    } else if (Opc == Instruction::Shl || Opc == Instruction::LShr ||
+               Opc == Instruction::AShr) {
+      if (IsZero(NarrowRHS)) FoldedResult = NarrowLHS;
+    }
+    if (FoldedResult) {
+      if (Cache)
+        (*Cache)[V] = FoldedResult;
+      return FoldedResult;
+    }
     IRBuilder<> B(InsertBefore);
     auto *Result = cast<Instruction>(B.CreateBinOp(
         (Instruction::BinaryOps)BO->getOpcode(), NarrowLHS, NarrowRHS,
@@ -1998,6 +2313,51 @@ Value *materializeTruncRootedValueAtWidth(Value *V, unsigned TargetWidth,
     if (Cache && Result)
       (*Cache)[V] = Result;
     return Result;
+  }
+
+  // Handle narrowable min/max/abs intrinsics.
+  if (auto *II = dyn_cast<IntrinsicInst>(V)) {
+    auto IID = II->getIntrinsicID();
+    switch (IID) {
+    case Intrinsic::umin:
+    case Intrinsic::umax:
+    case Intrinsic::smin:
+    case Intrinsic::smax: {
+      Value *NarrowA = materializeTruncRootedValueAtWidth(
+          II->getArgOperand(0), TargetWidth, InsertBefore, Cache);
+      Value *NarrowB = materializeTruncRootedValueAtWidth(
+          II->getArgOperand(1), TargetWidth, InsertBefore, Cache);
+      if (!NarrowA || !NarrowB)
+        return nullptr;
+      IRBuilder<> B(InsertBefore);
+      Function *NarrowFn =
+          Intrinsic::getOrInsertDeclaration(II->getModule(), IID, {TargetTy});
+      auto *Result = cast<Instruction>(
+          B.CreateCall(NarrowFn, {NarrowA, NarrowB}, II->getName() + ".narrow"));
+      Result->setDebugLoc(II->getDebugLoc());
+      if (Cache)
+        (*Cache)[V] = Result;
+      return Result;
+    }
+    case Intrinsic::abs: {
+      Value *NarrowA = materializeTruncRootedValueAtWidth(
+          II->getArgOperand(0), TargetWidth, InsertBefore, Cache);
+      if (!NarrowA)
+        return nullptr;
+      IRBuilder<> B(InsertBefore);
+      Function *NarrowFn =
+          Intrinsic::getOrInsertDeclaration(II->getModule(), Intrinsic::abs, {TargetTy});
+      Value *FalseC = ConstantInt::getFalse(II->getContext());
+      auto *Result = cast<Instruction>(
+          B.CreateCall(NarrowFn, {NarrowA, FalseC}, II->getName() + ".narrow"));
+      Result->setDebugLoc(II->getDebugLoc());
+      if (Cache)
+        (*Cache)[V] = Result;
+      return Result;
+    }
+    default:
+      break;
+    }
   }
 
   if (Width > TargetWidth) {
@@ -2025,8 +2385,20 @@ bool collectTruncRootedValueCost(
     return true;
 
   if (auto Ext = getExtOperandInfo(V)) {
-    if (TargetWidth < Ext->NarrowWidth || TargetWidth > Ext->WideWidth)
+    if (TargetWidth > Ext->WideWidth)
       return false;
+    if (TargetWidth < Ext->NarrowWidth) {
+      // Transitive chain: e.g. trunc(sext(sext(a:i8→i16)→i32), i8).
+      // Recurse into the extension's source to narrow it further.
+      if (!collectTruncRootedValueCost(Ext->NarrowValue, TargetWidth,
+                                       AddedValues, RemovedInstructions,
+                                       Visited))
+        return false;
+      if (Ext->Producer->hasOneUse())
+        RemovedInstructions.insert(Ext->Producer);
+      return true;
+    }
+    // TargetWidth in [NarrowWidth, WideWidth].
     if (TargetWidth != Ext->NarrowWidth)
       AddedValues.insert(V);
     if (Ext->Producer->hasOneUse())
@@ -2069,10 +2441,20 @@ bool collectTruncRootedValueCost(
     // lshr by constant k < TargetWidth is safe when the LHS has all bits
     // above TargetWidth-1 provably zero (same condition as the
     // tryShrinkTruncOfLowBitsBinOp entry check).
+    // lshr by constant k >= TargetWidth with a zero-bounded LHS gives 0,
+    // which is a free constant fold (no added instruction).
     if (BO->getOpcode() == Instruction::LShr) {
       auto *AmtC = dyn_cast<ConstantInt>(BO->getOperand(1));
-      if (!AmtC || AmtC->getValue().uge(TargetWidth))
+      if (!AmtC)
         return false;
+      if (AmtC->getValue().uge(TargetWidth)) {
+        // lshr of a zero-bounded value by >= TargetWidth bits yields 0.
+        if (!isZeroBoundedAtWidth(BO->getOperand(0), TargetWidth))
+          return false;
+        if (BO->hasOneUse())
+          RemovedInstructions.insert(BO);
+        return true; // Result is 0 -- no AddedValues entry needed.
+      }
       if (!isZeroBoundedAtWidth(BO->getOperand(0), TargetWidth))
         return false;
       if (!collectTruncRootedValueCost(BO->getOperand(0), TargetWidth,
@@ -2102,6 +2484,79 @@ bool collectTruncRootedValueCost(
       if (BO->hasOneUse())
         RemovedInstructions.insert(BO);
       return true;
+    }
+    // udiv/urem are narrowable when both operands are zero-bounded at
+    // TargetWidth: udiv(a,b)<=a and urem(a,b)<b, so the result fits.
+    if (BO->getOpcode() == Instruction::UDiv ||
+        BO->getOpcode() == Instruction::URem) {
+      if (!isZeroBoundedAtWidth(BO->getOperand(0), TargetWidth) ||
+          !isZeroBoundedAtWidth(BO->getOperand(1), TargetWidth))
+        return false;
+      if (!collectTruncRootedValueCost(BO->getOperand(0), TargetWidth,
+                                       AddedValues, RemovedInstructions,
+                                       Visited) ||
+          !collectTruncRootedValueCost(BO->getOperand(1), TargetWidth,
+                                       AddedValues, RemovedInstructions,
+                                       Visited))
+        return false;
+      AddedValues.insert(V);
+      if (BO->hasOneUse())
+        RemovedInstructions.insert(BO);
+      return true;
+    }
+  }
+
+  // Handle min/max/abs intrinsics that are narrowable.
+  if (auto *II = dyn_cast<IntrinsicInst>(V)) {
+    auto IID = II->getIntrinsicID();
+    switch (IID) {
+    case Intrinsic::umin:
+    case Intrinsic::umax:
+      // Narrowable when both args are zero-bounded at TargetWidth.
+      if (!isZeroBoundedAtWidth(II->getArgOperand(0), TargetWidth) ||
+          !isZeroBoundedAtWidth(II->getArgOperand(1), TargetWidth))
+        return false;
+      if (!collectTruncRootedValueCost(II->getArgOperand(0), TargetWidth,
+                                       AddedValues, RemovedInstructions,
+                                       Visited) ||
+          !collectTruncRootedValueCost(II->getArgOperand(1), TargetWidth,
+                                       AddedValues, RemovedInstructions,
+                                       Visited))
+        return false;
+      AddedValues.insert(V);
+      if (II->hasOneUse())
+        RemovedInstructions.insert(II);
+      return true;
+    case Intrinsic::smin:
+    case Intrinsic::smax:
+      // Narrowable when both args are sext-bounded at TargetWidth.
+      if (!collectTruncRootedValueCost(II->getArgOperand(0), TargetWidth,
+                                       AddedValues, RemovedInstructions,
+                                       Visited) ||
+          !collectTruncRootedValueCost(II->getArgOperand(1), TargetWidth,
+                                       AddedValues, RemovedInstructions,
+                                       Visited))
+        return false;
+      AddedValues.insert(V);
+      if (II->hasOneUse())
+        RemovedInstructions.insert(II);
+      return true;
+    case Intrinsic::abs: {
+      // abs(a, false) is narrowable when a is sext-bounded at TargetWidth.
+      auto *PoisonFlag = dyn_cast<ConstantInt>(II->getArgOperand(1));
+      if (!PoisonFlag || !PoisonFlag->isZero())
+        return false;
+      if (!collectTruncRootedValueCost(II->getArgOperand(0), TargetWidth,
+                                       AddedValues, RemovedInstructions,
+                                       Visited))
+        return false;
+      AddedValues.insert(V);
+      if (II->hasOneUse())
+        RemovedInstructions.insert(II);
+      return true;
+    }
+    default:
+      break;
     }
   }
 
@@ -2314,10 +2769,13 @@ bool tryShrinkTruncOfLowBitsRecurrence(TruncInst &Tr) {
   return true;
 }
 
-// Narrow  trunc(phi(v0, v1, ...))  when every incoming value is zero-bounded
-// at TargetWidth and materializable there.  This complements tryShrinkPhiOfExts
-// (which requires direct extensions) and handles cases where arms are bitwise
-// trees of zero-extensions or other zero-bounded expressions.
+// Narrow  trunc(phi(v0, v1, ...))  when every incoming value is materializable
+// at TargetWidth via the trunc-rooted cost infrastructure.  Handles arms that
+// are zero-bounded (zext trees) as well as sext-bounded (direct sext or
+// sext-rooted low-bit-preserving ops), since both are correctly narrowed by
+// collectTruncRootedValueCost / materializeTruncRootedValueAtWidth.
+// Complements tryShrinkPhiOfExts which requires all arms to have the same
+// extension kind; this function allows mixed sext/zext arms.
 bool tryShrinkTruncOfZeroBoundedPhi(TruncInst &Tr) {
   auto *Phi = dyn_cast<PHINode>(Tr.getOperand(0));
   if (!Phi || !Phi->hasOneUse())
@@ -2330,12 +2788,7 @@ bool tryShrinkTruncOfZeroBoundedPhi(TruncInst &Tr) {
   if (TargetWidth >= SourceWidth)
     return false;
 
-  // All incoming values must be zero-bounded at TargetWidth and materializable.
   unsigned N = Phi->getNumIncomingValues();
-  for (unsigned I = 0; I != N; ++I) {
-    if (!isZeroBoundedAtWidth(Phi->getIncomingValue(I), TargetWidth))
-      return false;
-  }
 
   // Cost check: use the trunc-rooted infrastructure on each arm.
   SmallPtrSet<Value *, 16> AddedValues;
@@ -2377,6 +2830,67 @@ bool tryShrinkTruncOfZeroBoundedPhi(TruncInst &Tr) {
   if (Phi->use_empty())
     RecursivelyDeleteTriviallyDeadInstructions(Phi);
 
+  return true;
+}
+
+// Narrow trunc(umin/umax/smin/smax/abs(...)) by applying the intrinsic at the
+// narrower width. For umin/umax the args must be zero-bounded; for smin/smax
+// and abs(false) the args must be sext-bounded at the target width.
+bool tryShrinkTruncOfMinMaxAbs(TruncInst &Tr) {
+  auto *II = dyn_cast<IntrinsicInst>(Tr.getOperand(0));
+  if (!II || !II->hasOneUse())
+    return false;
+  if (!isIntegerValue(&Tr) || !isIntegerValue(II))
+    return false;
+
+  unsigned TargetWidth = getValueWidth(&Tr);
+  unsigned SourceWidth = getValueWidth(II);
+  if (TargetWidth >= SourceWidth)
+    return false;
+
+  auto IID = II->getIntrinsicID();
+  switch (IID) {
+  case Intrinsic::umin:
+  case Intrinsic::umax:
+    if (!isZeroBoundedAtWidth(II->getArgOperand(0), TargetWidth) ||
+        !isZeroBoundedAtWidth(II->getArgOperand(1), TargetWidth))
+      return false;
+    break;
+  case Intrinsic::smin:
+  case Intrinsic::smax:
+    break; // collectTruncRootedValueCost will verify both args below
+  case Intrinsic::abs: {
+    auto *PoisonFlag = dyn_cast<ConstantInt>(II->getArgOperand(1));
+    if (!PoisonFlag || !PoisonFlag->isZero())
+      return false;
+    break;
+  }
+  default:
+    return false;
+  }
+
+  // Cost check: all args (and transitively their subexpressions) must be
+  // materializable at TargetWidth without increasing instruction count.
+  SmallPtrSet<Value *, 8> AddedValues;
+  SmallPtrSet<Instruction *, 8> RemovedInstructions;
+  SmallPtrSet<Value *, 8> Visited;
+  if (!collectTruncRootedValueCost(II, TargetWidth, AddedValues,
+                                   RemovedInstructions, Visited))
+    return false;
+  // +1 for the trunc itself being removed.
+  if (AddedValues.size() > RemovedInstructions.size() + 1)
+    return false;
+
+  DenseMap<Value *, Value *> Cache;
+  Value *NarrowResult =
+      materializeTruncRootedValueAtWidth(II, TargetWidth, &Tr, &Cache);
+  if (!NarrowResult)
+    return false;
+
+  Tr.replaceAllUsesWith(NarrowResult);
+  Tr.eraseFromParent();
+  if (II->use_empty())
+    RecursivelyDeleteTriviallyDeadInstructions(II);
   return true;
 }
 
@@ -3133,7 +3647,8 @@ LocalRewriteWorklists collectLocalRewriteWorklists(Function &F) {
         WL.Adds.push_back(BO);
       else if (BO->getOpcode() == Instruction::And)
         WL.Ands.push_back(BO);
-      else if (BO->getOpcode() == Instruction::UDiv)
+      else if (BO->getOpcode() == Instruction::UDiv ||
+               BO->getOpcode() == Instruction::URem)
         WL.UDivs.push_back(BO);
     } else if (auto *ZExt = dyn_cast<ZExtInst>(&I))
       WL.ZExts.push_back(ZExt);
@@ -3213,6 +3728,18 @@ bool runStructuralLocalRewritesToFixpoint(Function &F) {
         ChangedThisRound = true;
         continue;
       }
+      if (tryFoldTruncOfAndMask(*Tr)) {
+        ChangedThisRound = true;
+        continue;
+      }
+      if (tryFoldTruncOfTrunc(*Tr)) {
+        ChangedThisRound = true;
+        continue;
+      }
+      if (tryFoldTruncOfCtpop(*Tr)) {
+        ChangedThisRound = true;
+        continue;
+      }
       if (tryShrinkTruncOfShiftRecurrence(*Tr)) {
         ChangedThisRound = true;
         continue;
@@ -3226,6 +3753,10 @@ bool runStructuralLocalRewritesToFixpoint(Function &F) {
         continue;
       }
       if (tryShrinkTruncOfZeroBoundedPhi(*Tr)) {
+        ChangedThisRound = true;
+        continue;
+      }
+      if (tryShrinkTruncOfMinMaxAbs(*Tr)) {
         ChangedThisRound = true;
         continue;
       }
