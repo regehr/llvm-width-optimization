@@ -36,7 +36,7 @@ to reduce the number of LLVM width-changing instructions. These are
 Invoke the pass like this:
     
 ```
-/home/regehr/llvm-project-regehr/build/bin/opt \
+/home/regehr/llvm-project/for-alive/bin/opt \
     -load-pass-plugin /home/regehr/llvm-width-optimization/build/lib/libWidthOpt.so \
     -passes='width-opt' -S input.ll -o output.ll
 ```
