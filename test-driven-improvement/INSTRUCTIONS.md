@@ -13,14 +13,18 @@ same directory and update this document to specify using the tool
 instead of performing the described steps manually. Every time you
 do this, ask me first and provide a clear description of what you are
 automating.
-      
+
+Before doing anything else, go to the `build` directory and do a fresh
+compile of the optimizer.
+          
 ## Procedure
     
-There's a list of files here: `~/tmp/list.txt`. Read the first line of
-this file, and locate the specified file in `~/tmp/funcs1`. Move the
-file to a temporary location (don't copy it! we want to remove files
-so that we don't work on the same file twice) and also delete the
-first line from `list.txt`, so that the list stays up to date.
+There's a list of files here: `test-driven-improvement/list.txt`. Read
+the first line of this file, and locate the specified file in
+`test-driven-improvement/funcs`. Move the file to a temporary location
+(don't copy it!  we want to remove files so that we don't work on the
+same file twice) and also delete the first line from `list.txt`, so
+that the list stays up to date.
 
 The file you just moved will contain a single function in LLVM IR. You
 can find it easily by looking for a line that begins with "define ".
