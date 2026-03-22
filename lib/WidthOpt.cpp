@@ -744,6 +744,62 @@ bool tryShrinkICmpExtConst(ICmpInst &Cmp) {
     ICmpInst::Predicate NormalizedPred =
         ExtIdx == 0 ? Cmp.getPredicate() : Cmp.getSwappedPredicate();
 
+    // For SExt, unsigned predicates can be narrowed when the constant is
+    // non-negative and fits in (NarrowWidth-1) bits (i.e., < 2^(NarrowWidth-1)).
+    // sext(X) compared unsigned against such C behaves identically to
+    // unsigned comparison of X at the narrow type: negative X values produce
+    // huge unsigned sext results (>= 2^63) and are thus above C, matching the
+    // behavior of unsigned X (>= 2^(N-1)) also being above C.
+    if (ExtInfo->Kind == ExtKind::SExt && isUnsignedICmp(NormalizedPred)) {
+      const APInt &CV = C->getValue();
+      if (CV.isIntN(ExtInfo->NarrowWidth - 1)) {
+        // The constant fits in the non-negative range of the narrow type:
+        // convert unsigned predicate to same unsigned predicate at narrow width.
+        // (canRepresentConstant for ZExt checks this without sign; we reuse
+        // the unsigned narrowing path after adjusting the predicate scope.)
+        IRBuilder<> B(&Cmp);
+        Constant *NarrowC = convertConstantToNarrow(*C, ExtInfo->NarrowWidth);
+        Value *NewCmp = buildConstantAwareICmp(B, NormalizedPred,
+                                               ExtInfo->NarrowValue, NarrowC,
+                                               Cmp.getName());
+        if (auto *NewCmpI = dyn_cast<Instruction>(NewCmp)) {
+          NewCmpI->setDebugLoc(Cmp.getDebugLoc());
+          if (!NewCmpI->hasName())
+            NewCmpI->takeName(&Cmp);
+        }
+        Cmp.replaceAllUsesWith(NewCmp);
+        Cmp.eraseFromParent();
+        if (ExtInfo->Producer->use_empty())
+          RecursivelyDeleteTriviallyDeadInstructions(ExtInfo->Producer);
+        return true;
+      }
+      // If C >= 2^(N-1) (as unsigned i64): sext(X) (non-negative X) < 2^31
+      // is always < C since sext(X) < 2^31 <= C; negative X gives huge values.
+      // The result depends on predicate — leave for constant-fold if possible.
+      // Fall through to let the general path handle or skip.
+    }
+
+    // For ZExt, signed predicates can be handled by converting to unsigned.
+    // Since zext(X) is always non-negative, signed and unsigned order agree
+    // when comparing against a non-negative constant. Against a negative
+    // constant, the result is a trivial constant (zext(X) >= 0 > C_neg).
+    if (ExtInfo->Kind == ExtKind::ZExt && isSignedICmp(NormalizedPred)) {
+      if (C->getValue().isNonNegative()) {
+        NormalizedPred = ICmpInst::getUnsignedPredicate(NormalizedPred);
+      } else {
+        // Negative constant: zext(X) >= 0 > C, so sgt/sge are always true,
+        // slt/sle are always false.
+        bool AlwaysTrue = (NormalizedPred == ICmpInst::ICMP_SGT ||
+                           NormalizedPred == ICmpInst::ICMP_SGE);
+        Value *NewCmp = ConstantInt::get(Cmp.getType(), AlwaysTrue);
+        Cmp.replaceAllUsesWith(NewCmp);
+        Cmp.eraseFromParent();
+        if (ExtInfo->Producer->use_empty())
+          RecursivelyDeleteTriviallyDeadInstructions(ExtInfo->Producer);
+        return true;
+      }
+    }
+
     if (!isCompatiblePredForExtKind(NormalizedPred, ExtInfo->Kind))
       continue;
 
@@ -783,16 +839,25 @@ bool tryShrinkICmp(ICmpInst &Cmp) {
   if (!LHSInfo || !RHSInfo)
     return false;
 
-  unsigned TargetWidth =
-      computeShrinkWidth(Cmp.getPredicate(), *LHSInfo, *RHSInfo);
+  ICmpInst::Predicate Pred = Cmp.getPredicate();
+
+  // ZExt-ZExt with a signed ordering predicate: since zext always produces a
+  // non-negative value, the signed comparison is equivalent to the unsigned
+  // comparison at the narrow type.  E.g. icmp slt i32 (zext i8 a), (zext i8 b)
+  // ≡ icmp ult i8 a, b.
+  ICmpInst::Predicate NewPred = Pred;
+  if (LHSInfo->Kind == ExtKind::ZExt && RHSInfo->Kind == ExtKind::ZExt &&
+      isSignedICmp(Pred))
+    NewPred = ICmpInst::getUnsignedPredicate(Pred);
+
+  unsigned TargetWidth = computeShrinkWidth(NewPred, *LHSInfo, *RHSInfo);
   if (TargetWidth == 0 || TargetWidth >= LHSInfo->WideWidth)
     return false;
 
   IRBuilder<> B(&Cmp);
   Value *NewLHS = materializeAtWidth(B, *LHSInfo, TargetWidth);
   Value *NewRHS = materializeAtWidth(B, *RHSInfo, TargetWidth);
-  auto *NewCmp =
-      cast<ICmpInst>(B.CreateICmp(Cmp.getPredicate(), NewLHS, NewRHS));
+  auto *NewCmp = cast<ICmpInst>(B.CreateICmp(NewPred, NewLHS, NewRHS));
 
   SmallVector<Instruction *, 2> DeadRoots;
   if (LHSInfo->Producer != RHSInfo->Producer)
@@ -1585,6 +1650,511 @@ bool tryWidenAddThroughZExt(BinaryOperator &BO) {
   return trySide(0, 1) || trySide(1, 0);
 }
 
+// Handle: zext iN(add iN(trunc iW X, C)) where X is zero-bounded at N-1 bits
+// and C is a non-negative constant fitting in N-1 bits.
+//
+// Since X ≤ 2^(N-1)-1 and C ≤ 2^(N-1)-1, the add X+C ≤ 2^N-2 < 2^N, so no
+// unsigned overflow in iN.  The trunc is lossless because X ≤ 2^(N-1)-1 < 2^N.
+// Therefore: zext iN(add iN(trunc iW X, C)) == add iW(X, zext C to iW).
+//
+// Eliminates the trunc→add→zext chain, replacing it with a single wider add.
+bool tryWidenAddOverTruncThroughZExt(BinaryOperator &BO) {
+  if (BO.getOpcode() != Instruction::Add)
+    return false;
+  if (!isIntegerValue(&BO))
+    return false;
+  if (!BO.hasOneUse())
+    return false;
+
+  auto *WideZ = dyn_cast<ZExtInst>(*BO.user_begin());
+  if (!WideZ || !isIntegerValue(WideZ))
+    return false;
+
+  unsigned MidWidth = getValueWidth(&BO);
+  unsigned WideWidth = getValueWidth(WideZ);
+  assert(WideWidth > MidWidth);
+
+  if (MidWidth < 2)
+    return false; // Need at least 2 bits for "N-1 bits" check to be meaningful.
+
+  auto trySide = [&](unsigned TruncIdx, unsigned OtherIdx) -> bool {
+    auto *Tr = dyn_cast<TruncInst>(BO.getOperand(TruncIdx));
+    if (!Tr)
+      return false;
+    auto *C = dyn_cast<ConstantInt>(BO.getOperand(OtherIdx));
+    if (!C)
+      return false;
+
+    Value *X = Tr->getOperand(0);
+    if (getValueWidth(X) != WideWidth)
+      return false;
+
+    // Verify C is a non-negative value fitting in MidWidth-1 bits.
+    // isIntN checks unsigned fit, which for iN ConstantInt means C ∈ [0, 2^(N-1)-1].
+    if (!C->getValue().isIntN(MidWidth - 1))
+      return false;
+
+    // X must be zero-bounded at MidWidth-1 bits so trunc(X, iN) + C < 2^N.
+    if (!isZeroBoundedAtWidth(X, MidWidth - 1))
+      return false;
+
+    // Build wider add: add iW(X, C_wide)
+    Value *WideC = ConstantInt::get(IntegerType::get(BO.getContext(), WideWidth),
+                                    C->getValue().zext(WideWidth));
+    IRBuilder<> B(WideZ);
+    auto *WideAdd = cast<Instruction>(B.CreateAdd(X, WideC, BO.getName() + ".wide"));
+    WideAdd->setDebugLoc(BO.getDebugLoc());
+    WideZ->replaceAllUsesWith(WideAdd);
+    WideZ->eraseFromParent();
+    if (BO.use_empty())
+      RecursivelyDeleteTriviallyDeadInstructions(&BO);
+    return true;
+  };
+
+  return trySide(0, 1) || trySide(1, 0);
+}
+
+// Handle: zext nneg iN(sub iN(C, trunc iW X)) or zext nneg iN(sub iN(trunc iW X, C))
+// where X is zero-bounded at N bits and C is a non-negative constant.
+//
+// The zext nneg flag guarantees the sub result is non-negative, so no underflow.
+// The trunc is lossless (X ≤ 2^N - 1). Therefore the iN sub equals the iW sub.
+//
+// Transforms: zext nneg(sub(C, trunc(X))) → sub iW(C_wide, X)
+//             zext nneg(sub(trunc(X), C)) → sub iW(X, C_wide)
+bool tryWidenSubOverTruncThroughZExtNneg(ZExtInst &ZExt) {
+  if (!ZExt.hasNonNeg())
+    return false;
+  if (!isIntegerValue(&ZExt))
+    return false;
+
+  auto *Sub = dyn_cast<BinaryOperator>(ZExt.getOperand(0));
+  if (!Sub || Sub->getOpcode() != Instruction::Sub)
+    return false;
+  if (!Sub->hasOneUse())
+    return false;
+  if (!isIntegerValue(Sub))
+    return false;
+
+  unsigned MidWidth = getValueWidth(Sub);
+  unsigned WideWidth = getValueWidth(&ZExt);
+  assert(WideWidth > MidWidth);
+
+  // Try both orderings: sub(C, Tr) and sub(Tr, C).
+  auto trySide = [&](unsigned TruncIdx, unsigned ConstIdx) -> bool {
+    auto *Tr = dyn_cast<TruncInst>(Sub->getOperand(TruncIdx));
+    if (!Tr)
+      return false;
+    auto *C = dyn_cast<ConstantInt>(Sub->getOperand(ConstIdx));
+    if (!C || C->isNegative())
+      return false;
+
+    Value *X = Tr->getOperand(0);
+    if (getValueWidth(X) != WideWidth)
+      return false;
+
+    // Trunc must be lossless: X zero-bounded at MidWidth bits.
+    if (!isZeroBoundedAtWidth(X, MidWidth))
+      return false;
+
+    // Build wider sub: sub iW(Op0_wide, Op1_wide)
+    Value *WideC = ConstantInt::get(IntegerType::get(Sub->getContext(), WideWidth),
+                                    C->getValue().zext(WideWidth));
+    IRBuilder<> B(&ZExt);
+    Value *WideOp0 = (TruncIdx == 0) ? X : WideC;
+    Value *WideOp1 = (TruncIdx == 0) ? WideC : X;
+    auto *WideSub = cast<Instruction>(
+        B.CreateSub(WideOp0, WideOp1, Sub->getName() + ".wide"));
+    WideSub->setDebugLoc(Sub->getDebugLoc());
+    ZExt.replaceAllUsesWith(WideSub);
+    ZExt.eraseFromParent();
+    if (Sub->use_empty())
+      RecursivelyDeleteTriviallyDeadInstructions(Sub);
+    return true;
+  };
+
+  return trySide(0, 1) || trySide(1, 0);
+}
+
+// When a zext nneg is used only as GEP indices, we can eliminate the zext by
+// using the narrow value directly as the GEP index. The nneg flag guarantees
+// the value is non-negative, so GEP's signed index extension gives the same
+// result as the zero extension: sext(X) == zext(X) when X >= 0.
+// Example:
+//   %ext = zext nneg i32 %x to i64
+//   %gep = getelementptr T, ptr %p, i64 %ext
+// => %gep = getelementptr T, ptr %p, i32 %x
+// When sext iN X to iM is used only as GEP indices, we can eliminate the sext
+// by using X directly as the GEP index. GEP sign-extends its indices to
+// pointer width, which is exactly what sext does, so they are always equivalent.
+bool tryShrinkSExtGEPIndex(SExtInst &SExt) {
+  if (SExt.use_empty())
+    return false;
+  // All uses must be GEP index operands (not the base pointer, operand 0).
+  for (Use &U : SExt.uses()) {
+    auto *GEP = dyn_cast<GetElementPtrInst>(U.getUser());
+    if (!GEP || U.getOperandNo() == 0)
+      return false;
+  }
+  Value *NarrowSrc = SExt.getOperand(0);
+  SmallVector<GetElementPtrInst *, 4> GEPs;
+  for (Use &U : SExt.uses())
+    GEPs.push_back(cast<GetElementPtrInst>(U.getUser()));
+  for (GetElementPtrInst *GEP : GEPs)
+    GEP->replaceUsesOfWith(&SExt, NarrowSrc);
+  SExt.eraseFromParent();
+  return true;
+}
+
+bool tryShrinkZExtGEPIndex(ZExtInst &ZExt) {
+  // GEP sign-extends indices to pointer width, so replacing zext(X) with X
+  // is valid only when sext(X) == zext(X), i.e., X is non-negative.
+  // The nneg flag makes this explicit; alternatively, structural analysis can
+  // prove the source fits in (NarrowBits-1) unsigned bits, meaning the sign
+  // bit of the narrow type is always 0.
+  unsigned NarrowBits = ZExt.getSrcTy()->getIntegerBitWidth();
+  if (!ZExt.hasNonNeg() &&
+      !isZeroBoundedAtWidth(ZExt.getOperand(0), NarrowBits - 1))
+    return false;
+  // Only when all uses are GEP instructions using this as an index (not base).
+  if (ZExt.use_empty())
+    return false;
+  for (Use &U : ZExt.uses()) {
+    auto *GEP = dyn_cast<GetElementPtrInst>(U.getUser());
+    if (!GEP)
+      return false;
+    // Make sure this use is as an index operand, not the base pointer (op 0).
+    if (U.getOperandNo() == 0)
+      return false;
+  }
+  // Replace each GEP's use of this zext with the narrow source value.
+  Value *NarrowSrc = ZExt.getOperand(0);
+  SmallVector<GetElementPtrInst *, 4> GEPs;
+  for (Use &U : ZExt.uses())
+    GEPs.push_back(cast<GetElementPtrInst>(U.getUser()));
+  for (GetElementPtrInst *GEP : GEPs)
+    GEP->replaceUsesOfWith(&ZExt, NarrowSrc);
+  ZExt.eraseFromParent();
+  return true;
+}
+
+// When zext iN X to iM is used only by binops (lshr by constant ≥ 1, or and
+// with constant < 2^(N-1)) that themselves are used only as GEP indices, we
+// can narrow the entire chain back to iN. For example:
+//   %z  = zext i8 %x to i32
+//   %lo = lshr i32 %z, 4          ; result in [0,15] → fits in i8, non-neg
+//   %hi = and i32 %z, 15          ; result in [0,15] → fits in i8, non-neg
+//   %p1 = gep ..., i32 %lo
+//   %p2 = gep ..., i32 %hi
+// becomes:
+//   %lo = lshr i8 %x, 4
+//   %hi = and i8 %x, 15
+//   %p1 = gep ..., i8 %lo
+//   %p2 = gep ..., i8 %hi
+bool tryShrinkZExtThroughBinopToGEP(ZExtInst &ZExt) {
+  if (ZExt.use_empty())
+    return false;
+
+  Value *Src = ZExt.getOperand(0);
+  Type *NarrowTy = Src->getType();
+  unsigned NarrowBits = NarrowTy->getIntegerBitWidth();
+
+  // Validate all uses: each must be a lshr or and BinaryOperator with a
+  // constant that makes the result non-negative when interpreted as iN, and
+  // all uses of that BinaryOperator must be GEP index operands.
+  for (Use &U : ZExt.uses()) {
+    auto *BO = dyn_cast<BinaryOperator>(U.getUser());
+    if (!BO)
+      return false;
+    // ZExt must be the left operand.
+    if (U.getOperandNo() != 0)
+      return false;
+    auto *C = dyn_cast<ConstantInt>(BO->getOperand(1));
+    if (!C)
+      return false;
+
+    if (BO->getOpcode() == Instruction::LShr) {
+      // lshr result has at most (NarrowBits - shift) significant bits.
+      // For it to be non-negative as iN we need at least 1 bit shifted out.
+      uint64_t Shift = C->getZExtValue();
+      if (Shift == 0 || Shift >= NarrowBits)
+        return false;
+    } else if (BO->getOpcode() == Instruction::And) {
+      // and result is bounded by the constant. Non-negative as iN means the
+      // constant must be < 2^(NarrowBits-1).
+      APInt Mask = C->getValue();
+      if (!Mask.ult(APInt::getSignedMaxValue(NarrowBits).zext(
+              BO->getType()->getIntegerBitWidth()) + 1))
+        return false;
+    } else {
+      return false;
+    }
+
+    // All uses of the binop must be GEP index operands.
+    if (BO->use_empty())
+      return false;
+    for (Use &BOU : BO->uses()) {
+      auto *GEP = dyn_cast<GetElementPtrInst>(BOU.getUser());
+      if (!GEP || BOU.getOperandNo() == 0)
+        return false;
+    }
+  }
+
+  // Perform the transformation.
+  for (Use &U : ZExt.uses()) {
+    auto *BO = cast<BinaryOperator>(U.getUser());
+    IRBuilder<> B(BO);
+
+    // Build narrowed binop operating on the original i8/iN source.
+    Value *NarrowBO = nullptr;
+    auto *C = cast<ConstantInt>(BO->getOperand(1));
+    if (BO->getOpcode() == Instruction::LShr) {
+      Value *NarrowC = ConstantInt::get(NarrowTy, C->getZExtValue());
+      NarrowBO = B.CreateLShr(Src, NarrowC, BO->getName());
+    } else {
+      assert(BO->getOpcode() == Instruction::And);
+      APInt NarrowMask = C->getValue().trunc(NarrowBits);
+      NarrowBO = B.CreateAnd(Src, ConstantInt::get(NarrowTy, NarrowMask),
+                             BO->getName());
+    }
+
+    // Update all GEP users of this binop.
+    SmallVector<GetElementPtrInst *, 4> GEPs;
+    for (Use &BOU : BO->uses())
+      GEPs.push_back(cast<GetElementPtrInst>(BOU.getUser()));
+    for (GetElementPtrInst *GEP : GEPs)
+      GEP->replaceUsesOfWith(BO, NarrowBO);
+  }
+
+  // Erase the now-dead wide binops and the zext.
+  SmallVector<Instruction *, 4> ToErase;
+  for (Use &U : ZExt.uses())
+    ToErase.push_back(cast<Instruction>(U.getUser()));
+  for (Instruction *I : ToErase)
+    I->eraseFromParent();
+  ZExt.eraseFromParent();
+  return true;
+}
+
+// When zext iN X to iM is used only as the condition of switch statements,
+// we can narrow the switch to use X directly (replacing iM case constants
+// with iN truncations). Cases with values >= 2^N are unreachable since
+// zext only produces values in [0, 2^N), so we drop them (setting their
+// targets to the switch's default block — they become dead).
+bool tryShrinkZExtSwitch(ZExtInst &ZExt) {
+  if (ZExt.use_empty())
+    return false;
+
+  Value *Src = ZExt.getOperand(0);
+  Type *NarrowTy = Src->getType();
+  unsigned NarrowBits = NarrowTy->getIntegerBitWidth();
+  APInt MaxNarrow = APInt::getMaxValue(NarrowBits).zext(
+      ZExt.getType()->getIntegerBitWidth());
+
+  // All uses must be SwitchInsts where ZExt is the condition operand.
+  for (Use &U : ZExt.uses()) {
+    auto *SI = dyn_cast<SwitchInst>(U.getUser());
+    if (!SI || U.getOperandNo() != 0)
+      return false;
+  }
+
+  // Collect the switches and update them.
+  SmallVector<SwitchInst *, 4> Switches;
+  for (Use &U : ZExt.uses())
+    Switches.push_back(cast<SwitchInst>(U.getUser()));
+
+  for (SwitchInst *SI : Switches) {
+    // Change the condition to the narrow source.
+    SI->setCondition(Src);
+
+    // Update or remove each case. Cases with values > MaxNarrow are
+    // unreachable (zext can't produce them); remove them.
+    SmallVector<SwitchInst::CaseIt, 4> ToRemove;
+    for (auto It = SI->case_begin(), End = SI->case_end(); It != End; ++It) {
+      const APInt &CaseVal = It->getCaseValue()->getValue();
+      if (CaseVal.ugt(MaxNarrow)) {
+        ToRemove.push_back(It);
+      } else {
+        // Truncate the constant to the narrow type.
+        ConstantInt *NewC = ConstantInt::get(
+            ZExt.getContext(), CaseVal.trunc(NarrowBits));
+        It->setValue(NewC);
+      }
+    }
+    // Remove in reverse order to keep iterators valid.
+    for (auto It : llvm::reverse(ToRemove))
+      SI->removeCase(It);
+  }
+
+  ZExt.eraseFromParent();
+  return true;
+}
+
+// When sext iN X to iM is used only as the condition of switch statements,
+// we can narrow the switch to use X directly. sext produces values in the
+// signed range [-2^(N-1), 2^(N-1) - 1], so cases outside that range are
+// unreachable and are removed; in-range constants are truncated to iN.
+bool tryShrinkSExtSwitch(SExtInst &SExt) {
+  if (SExt.use_empty())
+    return false;
+
+  Value *Src = SExt.getOperand(0);
+  Type *NarrowTy = Src->getType();
+  unsigned NarrowBits = NarrowTy->getIntegerBitWidth();
+  unsigned WideBits = SExt.getType()->getIntegerBitWidth();
+
+  // All uses must be SwitchInsts where SExt is the condition operand.
+  for (Use &U : SExt.uses()) {
+    auto *SI = dyn_cast<SwitchInst>(U.getUser());
+    if (!SI || U.getOperandNo() != 0)
+      return false;
+  }
+
+  // Collect the switches.
+  SmallVector<SwitchInst *, 4> Switches;
+  for (Use &U : SExt.uses())
+    Switches.push_back(cast<SwitchInst>(U.getUser()));
+
+  for (SwitchInst *SI : Switches) {
+    SI->setCondition(Src);
+
+    SmallVector<SwitchInst::CaseIt, 4> ToRemove;
+    for (auto It = SI->case_begin(), End = SI->case_end(); It != End; ++It) {
+      const APInt &CaseVal = It->getCaseValue()->getValue();
+      // A case is reachable iff sext(trunc(CaseVal)) == CaseVal.
+      APInt Truncated = CaseVal.trunc(NarrowBits);
+      if (Truncated.sext(WideBits) != CaseVal) {
+        ToRemove.push_back(It);
+      } else {
+        ConstantInt *NewC = ConstantInt::get(SExt.getContext(), Truncated);
+        It->setValue(NewC);
+      }
+    }
+    for (auto It : llvm::reverse(ToRemove))
+      SI->removeCase(It);
+  }
+
+  SExt.eraseFromParent();
+  return true;
+}
+
+// Eliminate a zext when the only use is an llvm.expect.iM call whose only use
+// is an icmp ne/eq with zero:
+//
+//   %z   = zext i1 %x to i64
+//   %exp = call i64 @llvm.expect.i64(i64 %z, i64 0)
+//   %cmp = icmp ne i64 %exp, 0
+//
+// becomes:
+//
+//   %exp = call i1 @llvm.expect.i1(i1 %x, i1 false)
+//   %cmp = icmp ne i1 %exp, false
+//
+// Correctness: zext i1 %x to i64 is 0 or 1, so
+//   llvm.expect.i64(%z, 0) != 0  iff  %x != false
+// The expect hint is preserved (expected value mapped to same bool).
+// Verified with alive-tv.
+bool tryShrinkZExtOfLLVMExpect(ZExtInst &ZExt) {
+  if (ZExt.use_empty())
+    return false;
+
+  // Source must be i1.
+  if (!ZExt.getSrcTy()->isIntegerTy(1))
+    return false;
+
+  // All uses must be llvm.expect.iM calls where ZExt is the first argument.
+  for (Use &U : ZExt.uses()) {
+    auto *CI = dyn_cast<CallInst>(U.getUser());
+    if (!CI)
+      return false;
+    Function *Callee = CI->getCalledFunction();
+    if (!Callee)
+      return false;
+    Intrinsic::ID IID = Callee->getIntrinsicID();
+    if (IID != Intrinsic::expect && IID != Intrinsic::expect_with_probability)
+      return false;
+    if (U.getOperandNo() != 0)
+      return false;
+    // The expect call's only use must be icmp eq/ne with zero.
+    if (!CI->hasOneUse())
+      return false;
+    auto *Cmp = dyn_cast<ICmpInst>(CI->user_back());
+    if (!Cmp)
+      return false;
+    ICmpInst::Predicate Pred = Cmp->getPredicate();
+    if (Pred != ICmpInst::ICMP_NE && Pred != ICmpInst::ICMP_EQ)
+      return false;
+    // One operand must be the expect call, the other must be zero.
+    Value *OtherOp = Cmp->getOperand(0) == CI ? Cmp->getOperand(1)
+                                               : Cmp->getOperand(0);
+    auto *ConstOther = dyn_cast<ConstantInt>(OtherOp);
+    if (!ConstOther || !ConstOther->isZero())
+      return false;
+  }
+
+  // Collect calls to transform.
+  SmallVector<CallInst *, 4> Calls;
+  for (Use &U : ZExt.uses())
+    Calls.push_back(cast<CallInst>(U.getUser()));
+
+  Value *NarrowSrc = ZExt.getOperand(0); // i1 value
+  LLVMContext &Ctx = ZExt.getContext();
+  Module *M = ZExt.getModule();
+
+  for (CallInst *CI : Calls) {
+    Function *Callee = CI->getCalledFunction();
+    Intrinsic::ID IID = Callee->getIntrinsicID();
+
+    // Map the expected value: the second argument should be 0 or 1.
+    // We convert it to i1 (0→false, nonzero→true).
+    Value *ExpectedWide = CI->getArgOperand(1);
+    ConstantInt *ExpectedConst = cast<ConstantInt>(ExpectedWide);
+    Constant *ExpectedNarrow = ExpectedConst->isZero()
+                                   ? ConstantInt::getFalse(Ctx)
+                                   : ConstantInt::getTrue(Ctx);
+
+    // Build the narrow expect call.
+    Function *NarrowExpect;
+    if (IID == Intrinsic::expect_with_probability) {
+      NarrowExpect = Intrinsic::getOrInsertDeclaration(
+          M, IID, {Type::getInt1Ty(Ctx)});
+      // Third argument is the probability (double), keep it unchanged.
+      Value *Prob = CI->getArgOperand(2);
+      IRBuilder<> B(CI);
+      CallInst *NewCall =
+          B.CreateCall(NarrowExpect, {NarrowSrc, ExpectedNarrow, Prob});
+      NewCall->setDebugLoc(CI->getDebugLoc());
+      // Replace the icmp.
+      ICmpInst *Cmp = cast<ICmpInst>(CI->user_back());
+      Value *NewCmp = B.CreateICmp(Cmp->getPredicate(), NewCall,
+                                   ConstantInt::getFalse(Ctx), Cmp->getName());
+      if (auto *NewCmpI = dyn_cast<Instruction>(NewCmp))
+        NewCmpI->setDebugLoc(Cmp->getDebugLoc());
+      Cmp->replaceAllUsesWith(NewCmp);
+      Cmp->eraseFromParent();
+    } else {
+      NarrowExpect = Intrinsic::getOrInsertDeclaration(
+          M, IID, {Type::getInt1Ty(Ctx)});
+      IRBuilder<> B(CI);
+      CallInst *NewCall =
+          B.CreateCall(NarrowExpect, {NarrowSrc, ExpectedNarrow});
+      NewCall->setDebugLoc(CI->getDebugLoc());
+      // Replace the icmp.
+      ICmpInst *Cmp = cast<ICmpInst>(CI->user_back());
+      Value *NewCmp = B.CreateICmp(Cmp->getPredicate(), NewCall,
+                                   ConstantInt::getFalse(Ctx), Cmp->getName());
+      if (auto *NewCmpI = dyn_cast<Instruction>(NewCmp))
+        NewCmpI->setDebugLoc(Cmp->getDebugLoc());
+      Cmp->replaceAllUsesWith(NewCmp);
+      Cmp->eraseFromParent();
+    }
+    CI->eraseFromParent();
+  }
+
+  ZExt.eraseFromParent();
+  return true;
+}
+
 // When the operand of a zext is structurally zero-bounded at a width NW2
 // narrower than the zext's source type NW1, we can rebuild the operand at
 // NW2 and emit a single zext from NW2 to WW instead.  Example:
@@ -1702,6 +2272,42 @@ bool tryFoldZExtOfTruncToMask(ZExtInst &Ext) {
   if (Tr->use_empty())
     RecursivelyDeleteTriviallyDeadInstructions(Tr);
 
+  return true;
+}
+
+// When trunc iM X to iN is used only as GEP indices, and X is provably
+// non-negative and fits in iN (i.e., the high M-N bits of X are all zero AND
+// bit N-1 of X is zero), we can use X directly in the GEP as an iM index and
+// eliminate the trunc. The correctness condition is:
+//   sext(trunc(X, N), M) == X
+// which holds iff X < 2^(N-1) (non-negative, fits in signed iN).
+// We check this via isZeroBoundedAtWidth(X, N-1).
+bool tryShrinkTruncGEPIndex(TruncInst &Tr) {
+  if (Tr.use_empty())
+    return false;
+
+  Value *Src = Tr.getOperand(0);
+  unsigned NarrowBits = Tr.getType()->getIntegerBitWidth();
+
+  // All uses must be GEP index operands (operand 0 is the base pointer).
+  for (Use &U : Tr.uses()) {
+    auto *GEP = dyn_cast<GetElementPtrInst>(U.getUser());
+    if (!GEP || U.getOperandNo() == 0)
+      return false;
+  }
+
+  // Src must be provably < 2^(NarrowBits-1) so that sext(trunc(Src)) == Src.
+  // isZeroBoundedAtWidth checks that the value fits in the given bit width.
+  if (!isZeroBoundedAtWidth(Src, NarrowBits - 1))
+    return false;
+
+  // Replace each GEP's use of the trunc with the wider Src.
+  SmallVector<GetElementPtrInst *, 4> GEPs;
+  for (Use &U : Tr.uses())
+    GEPs.push_back(cast<GetElementPtrInst>(U.getUser()));
+  for (GetElementPtrInst *GEP : GEPs)
+    GEP->replaceUsesOfWith(&Tr, Src);
+  Tr.eraseFromParent();
   return true;
 }
 
@@ -1823,6 +2429,113 @@ bool tryFoldTruncOfTrunc(TruncInst &Tr) {
   return true;
 }
 
+// Fold: trunc(lshr(X, K)) to i1  →  icmp ne (and X, 1<<K), 0
+//
+// When the target width is 1, truncating a value extracts exactly bit 0 of
+// that value.  After lshr(X, K), bit 0 is original bit K of X.  We can
+// express this without a trunc using a bitmask test:
+//   bit K of X ≠ 0   ⟺   (X & (1 << K)) ≠ 0
+//
+// Requirements:
+//  - TargetWidth is 1 (we're producing an i1)
+//  - Operand is lshr with a constant shift K satisfying 0 < K < SrcWidth
+//  - The single-use condition for lshr is NOT required (we only mask X)
+bool tryFoldTruncToI1ViaLShrAndMask(TruncInst &Tr) {
+  if (getValueWidth(&Tr) != 1)
+    return false;
+  if (!isIntegerValue(&Tr))
+    return false;
+
+  auto *LShr = dyn_cast<BinaryOperator>(Tr.getOperand(0));
+  if (!LShr || LShr->getOpcode() != Instruction::LShr)
+    return false;
+  if (!isIntegerValue(LShr))
+    return false;
+
+  auto *ShiftC = dyn_cast<ConstantInt>(LShr->getOperand(1));
+  if (!ShiftC)
+    return false;
+
+  unsigned SrcWidth = getValueWidth(LShr);
+  uint64_t K = ShiftC->getZExtValue();
+  // K must be in [1, SrcWidth-1]: K=0 is identity (no shift to undo),
+  // K>=SrcWidth gives poison in LLVM IR.
+  if (K == 0 || K >= SrcWidth)
+    return false;
+
+  // Build: and X, (1 << K); icmp ne ..., 0
+  Value *X = LShr->getOperand(0);
+  IRBuilder<> B(&Tr);
+  APInt BitMask = APInt::getOneBitSet(SrcWidth, (unsigned)K);
+  auto *AndInst = cast<Instruction>(
+      B.CreateAnd(X, ConstantInt::get(LShr->getType(), BitMask),
+                  Twine("bit") + Twine((unsigned)K)));
+  AndInst->setDebugLoc(Tr.getDebugLoc());
+  auto *Cmp = cast<Instruction>(
+      B.CreateICmpNE(AndInst, ConstantInt::get(LShr->getType(), 0),
+                     Tr.getName()));
+  Cmp->setDebugLoc(Tr.getDebugLoc());
+
+  Tr.replaceAllUsesWith(Cmp);
+  Tr.eraseFromParent();
+  if (LShr->use_empty())
+    RecursivelyDeleteTriviallyDeadInstructions(LShr);
+  return true;
+}
+
+// Fold: trunc iN X to i1 when X is zero-bounded at 1 bit  →  icmp ne iN X, 0
+//
+// When X is provably in [0, 2) (via !range metadata or other structural
+// analysis), truncating to i1 extracts bit 0 which is X itself.
+// Replacing with icmp ne eliminates the trunc.
+bool tryFoldTruncToI1WhenSrcIsZeroBounded(TruncInst &Tr) {
+  if (getValueWidth(&Tr) != 1)
+    return false;
+  if (!isIntegerValue(&Tr))
+    return false;
+
+  Value *Src = Tr.getOperand(0);
+  // nuw case is already handled by tryFoldTruncNuwToI1; only run this check
+  // for instructions whose source is zero-bounded via other evidence.
+  if (Tr.hasNoUnsignedWrap())
+    return false;
+  if (!isZeroBoundedAtWidth(Src, 1))
+    return false;
+
+  IRBuilder<> B(&Tr);
+  auto *Cmp = cast<Instruction>(
+      B.CreateICmpNE(Src, ConstantInt::get(Src->getType(), 0), Tr.getName()));
+  Cmp->setDebugLoc(Tr.getDebugLoc());
+  Tr.replaceAllUsesWith(Cmp);
+  Tr.eraseFromParent();
+  return true;
+}
+
+// Fold: trunc nuw iN X to i1  →  icmp ne iN X, 0
+//
+// The `nuw` flag on a trunc means the truncated-away bits are all zero.
+// For a target width of 1, this means X ∈ {0, 1}.  In that case:
+//   trunc nuw iN X to i1  is equivalent to  icmp ne iN X, 0
+// Both yield 0 when X=0 and 1 when X=1.  Replacing eliminates the trunc.
+bool tryFoldTruncNuwToI1(TruncInst &Tr) {
+  if (getValueWidth(&Tr) != 1)
+    return false;
+  if (!isIntegerValue(&Tr))
+    return false;
+  if (!Tr.hasNoUnsignedWrap())
+    return false;
+
+  Value *Src = Tr.getOperand(0);
+  IRBuilder<> B(&Tr);
+  auto *Cmp = cast<Instruction>(
+      B.CreateICmpNE(Src, ConstantInt::get(Src->getType(), 0), Tr.getName()));
+  Cmp->setDebugLoc(Tr.getDebugLoc());
+
+  Tr.replaceAllUsesWith(Cmp);
+  Tr.eraseFromParent();
+  return true;
+}
+
 // trunc(ctpop(zext(a:N→W)), N) = ctpop(a:N)
 // because zext does not add any set bits so ctpop of the zext equals ctpop
 // of the original value, and ctpop(a:N) <= N which always fits in N bits.
@@ -1870,10 +2583,45 @@ bool isZeroBoundedAtWidth(Value *V, unsigned Width) {
     return Ext->Kind == ExtKind::ZExt && Ext->NarrowWidth <= Width;
   if (auto *C = dyn_cast<ConstantInt>(V))
     return C->getValue().isIntN(Width);
+  // Check LLVM !range metadata on loads/calls.  A !range MDNode carries pairs
+  // of {lo, hi} ConstantInt values; each pair represents the half-open
+  // interval [lo, hi).  hi==0 is special and wraps around (means the interval
+  // extends to the type's maximum value).  We accept the metadata only when
+  // every interval's exclusive upper bound satisfies hi <= 2^Width.
+  if (auto *I = dyn_cast<Instruction>(V)) {
+    if (MDNode *RangeMD = I->getMetadata(LLVMContext::MD_range)) {
+      unsigned N = RangeMD->getNumOperands();
+      assert(N >= 2 && N % 2 == 0 && "malformed !range metadata");
+      APInt Limit = APInt::getOneBitSet(
+          cast<IntegerType>(V->getType())->getBitWidth(), Width);
+      bool AllFit = true;
+      for (unsigned i = 0; i < N; i += 2) {
+        auto *HiC = mdconst::extract<ConstantInt>(RangeMD->getOperand(i + 1));
+        APInt Hi = HiC->getValue();
+        // hi==0 wraps (covers max value); hi>Limit means some values exceed Width bits.
+        if (Hi.isZero() || Hi.ugt(Limit)) {
+          AllFit = false;
+          break;
+        }
+      }
+      if (AllFit)
+        return true;
+    }
+  }
   if (auto *BO = dyn_cast<BinaryOperator>(V)) {
-    // lshr shifts zeros in from the left, so zero-boundedness is preserved.
-    if (BO->getOpcode() == Instruction::LShr)
+    // lshr with a known constant shift amount k produces a result with at most
+    // (SrcBits - k) significant bits, so it is bounded at Width when
+    // SrcBits - k <= Width, regardless of the dividend's boundedness.
+    // Without a constant shift, fall back to checking the dividend.
+    if (BO->getOpcode() == Instruction::LShr) {
+      if (auto *ShiftC = dyn_cast<ConstantInt>(BO->getOperand(1))) {
+        unsigned Shift = (unsigned)ShiftC->getZExtValue();
+        unsigned SrcBits = BO->getType()->getIntegerBitWidth();
+        if (Shift < SrcBits && SrcBits - Shift <= Width)
+          return true;
+      }
       return isZeroBoundedAtWidth(BO->getOperand(0), Width);
+    }
     // and can only clear bits, so it is zero-bounded if either operand is.
     if (BO->getOpcode() == Instruction::And)
       return isZeroBoundedAtWidth(BO->getOperand(0), Width) ||
@@ -1900,6 +2648,16 @@ bool isZeroBoundedAtWidth(Value *V, unsigned Width) {
     if (II->getIntrinsicID() == Intrinsic::umax)
       return isZeroBoundedAtWidth(II->getArgOperand(0), Width) &&
              isZeroBoundedAtWidth(II->getArgOperand(1), Width);
+    // ctlz/cttz(iW, is_zero_poison): result is at most W (if false) or W-1 (if true).
+    // Check whether that maximum fits in Width bits unsigned.
+    if (II->getIntrinsicID() == Intrinsic::ctlz ||
+        II->getIntrinsicID() == Intrinsic::cttz) {
+      unsigned ArgBits = II->getArgOperand(0)->getType()->getIntegerBitWidth();
+      auto *PoisonFlag = dyn_cast<ConstantInt>(II->getArgOperand(1));
+      // With is_zero_poison=true, result ≤ ArgBits-1; otherwise result ≤ ArgBits.
+      unsigned MaxVal = (PoisonFlag && PoisonFlag->isOne()) ? ArgBits - 1 : ArgBits;
+      return APInt(64, MaxVal).isIntN(Width);
+    }
   }
   return false;
 }
@@ -1915,6 +2673,185 @@ bool collectTruncRootedValueCost(
     Value *V, unsigned TargetWidth, SmallPtrSetImpl<Value *> &AddedValues,
     SmallPtrSetImpl<Instruction *> &RemovedInstructions,
     SmallPtrSetImpl<Value *> &Visited);
+
+/// Handle the SROA i128 construct/destruct pattern:
+///   %mask   = and i128 %hi_src, HIGH_MASK   (HIGH_MASK has bits only in positions >= TargetWidth)
+///   %lo_ext = zext iN %lo to i128
+///   %combined = or i128 %mask, %lo_ext      (has exactly 2 uses: Tr and a shift)
+///   Tr      = trunc i128 %combined to iN    ← this trunc, replaced with %lo
+///   %shift  = lshr i128 %combined, N
+///   %hi_result = trunc i128 %shift to iN    (kept; %shift now reads %mask directly)
+///
+/// Handle the SROA high-half extract pattern:
+///   hi_ext  = zext iN %hi to i2N
+///   hi_shl  = shl i2N hi_ext, N
+///   lo_part = <value zero-bounded at N bits>
+///   combined = or i2N lo_part, hi_shl
+///   mask    = and i2N combined, HIGH_MASK    (HIGH_MASK has zeros in 0..N-1)
+///   shift   = lshr i2N mask, N
+///   Tr      = trunc i2N shift to iN          ← replaced by %hi
+///
+/// Semantics: and(or(lo, shl(zext(hi), N)), HIGH_MASK) = shl(zext(hi), N)
+/// because lo is zero in bits N+, and HIGH_MASK kills bits 0..N-1.
+/// Then lshr(shl(zext(hi), N), N) = zext(hi), and trunc(zext(hi), N) = hi.
+bool tryShrinkHighHalfSROA(TruncInst &Tr) {
+  unsigned TargetWidth = getValueWidth(&Tr);
+  unsigned SrcWidth = Tr.getSrcTy()->getIntegerBitWidth();
+  if (SrcWidth != 2 * TargetWidth)
+    return false;
+
+  // Tr feeds from lshr by TargetWidth with one use (Tr itself).
+  auto *LShr = dyn_cast<BinaryOperator>(Tr.getOperand(0));
+  if (!LShr || LShr->getOpcode() != Instruction::LShr || !LShr->hasOneUse())
+    return false;
+  auto *ShiftAmt = dyn_cast<ConstantInt>(LShr->getOperand(1));
+  if (!ShiftAmt || ShiftAmt->getZExtValue() != TargetWidth)
+    return false;
+
+  // lshr's source is and(V, HIGH_MASK) where HIGH_MASK has zeros in bits 0..N-1.
+  auto *MaskBO = dyn_cast<BinaryOperator>(LShr->getOperand(0));
+  if (!MaskBO || MaskBO->getOpcode() != Instruction::And)
+    return false;
+  Value *V = nullptr;
+  for (unsigned Idx = 0; Idx < 2; ++Idx) {
+    if (auto *C = dyn_cast<ConstantInt>(MaskBO->getOperand(Idx))) {
+      if (C->getValue().trunc(TargetWidth).isZero()) {
+        V = MaskBO->getOperand(1 - Idx);
+        break;
+      }
+    }
+  }
+  if (!V)
+    return false;
+
+  // V = or i2N LowPart, HiShl   (or HiShl, LowPart)
+  auto *OrBO = dyn_cast<BinaryOperator>(V);
+  if (!OrBO || OrBO->getOpcode() != Instruction::Or)
+    return false;
+
+  // Find which or-operand is shl(zext(hi), N) and which is the low part.
+  Value *HiVal = nullptr;
+  for (unsigned Idx = 0; Idx < 2; ++Idx) {
+    auto *ShlBO = dyn_cast<BinaryOperator>(OrBO->getOperand(Idx));
+    if (!ShlBO || ShlBO->getOpcode() != Instruction::Shl || !ShlBO->hasOneUse())
+      continue;
+    auto *ShlAmt = dyn_cast<ConstantInt>(ShlBO->getOperand(1));
+    if (!ShlAmt || ShlAmt->getZExtValue() != TargetWidth)
+      continue;
+    auto *ZE = dyn_cast<ZExtInst>(ShlBO->getOperand(0));
+    if (!ZE || ZE->getSrcTy()->getIntegerBitWidth() != TargetWidth ||
+        !ZE->hasOneUse())
+      continue;
+    // Verify the other or-operand contributes nothing to bits >= TargetWidth.
+    Value *LowPart = OrBO->getOperand(1 - Idx);
+    if (!isZeroBoundedAtWidth(LowPart, TargetWidth))
+      continue;
+    HiVal = ZE->getOperand(0);
+    break;
+  }
+  if (!HiVal)
+    return false;
+
+  // Replace Tr with HiVal and clean up dead instructions.
+  Tr.replaceAllUsesWith(HiVal);
+  Tr.eraseFromParent();
+  if (LShr->use_empty())
+    RecursivelyDeleteTriviallyDeadInstructions(LShr);
+  return true;
+}
+
+/// Semantics: trunc(or(and(X, HIGH_MASK), zext(lo)), N) == lo  because the and
+/// masks out all low bits, so only the zext contributes to positions 0..N-1.
+/// Also: trunc(lshr(or(%mask, %lo_ext), N), N) == trunc(lshr(%mask, N), N)
+/// because %lo_ext occupies only bits 0..N-1 which shift out entirely.
+bool tryShrinkSROAI128Destruct(TruncInst &Tr) {
+  unsigned TargetWidth = getValueWidth(&Tr);
+  unsigned SourceWidth = Tr.getSrcTy()->getIntegerBitWidth();
+  if (TargetWidth >= SourceWidth)
+    return false;
+
+  auto *OR_BO = dyn_cast<BinaryOperator>(Tr.getOperand(0));
+  if (!OR_BO || OR_BO->getOpcode() != Instruction::Or)
+    return false;
+
+  // OR_BO may have multiple trunc uses (all replaced with LoVal) plus exactly
+  // one lshr by TargetWidth use (redirected to MaskVal). Collect them.
+  // Other users (icmp, and, etc.) are left unchanged.
+  SmallVector<BinaryOperator *, 4> HighShifts;
+  SmallVector<TruncInst *, 4> LowTruncs;
+  for (User *U : OR_BO->users()) {
+    if (auto *T = dyn_cast<TruncInst>(U)) {
+      if (getValueWidth(T) != TargetWidth)
+        continue; // different-width trunc: leave alone
+      LowTruncs.push_back(T);
+    } else if (auto *LShr = dyn_cast<BinaryOperator>(U)) {
+      if (LShr->getOpcode() != Instruction::LShr)
+        continue; // other binop use: leave alone
+      auto *ShiftAmt = dyn_cast<ConstantInt>(LShr->getOperand(1));
+      if (!ShiftAmt || ShiftAmt->getZExtValue() != TargetWidth)
+        continue;
+      if (!LShr->hasOneUse())
+        continue;
+      auto *HighTrunc = dyn_cast<TruncInst>(*LShr->user_begin());
+      if (!HighTrunc || getValueWidth(HighTrunc) != TargetWidth)
+        continue;
+      HighShifts.push_back(LShr);
+    }
+    // Other users (icmp, and, etc.) are left unchanged.
+  }
+  if (HighShifts.empty() && LowTruncs.empty())
+    return false;
+
+  // Identify: which operand of OR is zext(lo) and which is the HIGH_MASK side?
+  Value *LoVal = nullptr;
+  Value *MaskVal = nullptr;
+
+  for (unsigned Idx = 0; Idx < 2; ++Idx) {
+    Value *Op = OR_BO->getOperand(Idx);
+    if (auto *ZE = dyn_cast<ZExtInst>(Op)) {
+      if (ZE->getSrcTy()->getIntegerBitWidth() == TargetWidth &&
+          ZE->getDestTy() == OR_BO->getType()) {
+        LoVal = ZE->getOperand(0);
+        MaskVal = OR_BO->getOperand(1 - Idx);
+        break;
+      }
+    }
+  }
+  if (!LoVal || !MaskVal)
+    return false;
+
+  // Verify MaskVal is an `and X, C` where C has all zeros in the low TargetWidth bits.
+  // This guarantees low bits of OR come entirely from the zext(lo).
+  auto *MaskBO = dyn_cast<BinaryOperator>(MaskVal);
+  if (!MaskBO || MaskBO->getOpcode() != Instruction::And)
+    return false;
+  bool FoundHighMask = false;
+  for (unsigned Idx = 0; Idx < 2; ++Idx) {
+    if (auto *C = dyn_cast<ConstantInt>(MaskBO->getOperand(Idx))) {
+      if (C->getValue().trunc(TargetWidth).isZero()) {
+        FoundHighMask = true;
+        break;
+      }
+    }
+  }
+  if (!FoundHighMask)
+    return false;
+
+  // Transform:
+  // 1. Replace all low truncs with LoVal — the low TargetWidth bits of OR
+  //    come only from zext(lo).
+  // 2. Redirect HighShift from OR_BO to MaskVal — the low bits contributed
+  //    by zext(lo) are shifted out entirely by TargetWidth.
+  for (TruncInst *LT : LowTruncs) {
+    LT->replaceAllUsesWith(LoVal);
+    LT->eraseFromParent();
+  }
+  for (BinaryOperator *HighShift : HighShifts)
+    HighShift->replaceUsesOfWith(OR_BO, MaskVal);
+  if (OR_BO->use_empty())
+    RecursivelyDeleteTriviallyDeadInstructions(OR_BO);
+  return true;
+}
 
 bool tryShrinkTruncOfLowBitsBinOp(TruncInst &Tr) {
   auto *BO = dyn_cast<BinaryOperator>(Tr.getOperand(0));
@@ -2039,25 +2976,51 @@ bool tryShrinkTruncOfLowBitsBinOp(TruncInst &Tr) {
           AshrChainBase = Inner->getOperand(0);
         }
         auto LHSInfo = getExtOperandInfo(AshrChainBase);
-        if (LHSInfo && LHSInfo->Kind == ExtKind::SExt &&
-            LHSInfo->NarrowWidth == TargetWidth &&
+        if (LHSInfo && LHSInfo->NarrowWidth == TargetWidth &&
             TotalShift < TargetWidth) {
           IRBuilder<> B(&Tr);
           auto *NarrowAmt = ConstantInt::get(
               IntegerType::get(Tr.getContext(), TargetWidth), TotalShift);
-          auto *NewAShr = cast<Instruction>(
-              B.CreateAShr(LHSInfo->NarrowValue, NarrowAmt, Tr.getName()));
-          NewAShr->setDebugLoc(Tr.getDebugLoc());
-          Tr.replaceAllUsesWith(NewAShr);
+          Instruction *NewShift;
+          if (LHSInfo->Kind == ExtKind::SExt) {
+            // trunc(ashr*(sext(a:N→W), k_total), N) = ashr(a, k_total)
+            NewShift = cast<Instruction>(
+                B.CreateAShr(LHSInfo->NarrowValue, NarrowAmt, Tr.getName()));
+          } else {
+            // trunc(ashr*(zext(a:N→W), k_total), N) = lshr(a, k_total)
+            // because zext fills upper bits with 0, making ashr == lshr.
+            NewShift = cast<Instruction>(
+                B.CreateLShr(LHSInfo->NarrowValue, NarrowAmt, Tr.getName()));
+          }
+          NewShift->setDebugLoc(Tr.getDebugLoc());
+          Tr.replaceAllUsesWith(NewShift);
           Tr.eraseFromParent();
           if (BO->use_empty())
             RecursivelyDeleteTriviallyDeadInstructions(BO);
           return true;
         }
       }
+      // Single-ashr case (no chain). Handle both SExt and ZExt roots.
       auto LHSInfo = getExtOperandInfo(BO->getOperand(0));
-      if (!LHSInfo || LHSInfo->Kind != ExtKind::SExt ||
-          LHSInfo->NarrowWidth > TargetWidth)
+      if (!LHSInfo || LHSInfo->NarrowWidth > TargetWidth)
+        return false;
+      uint64_t ShiftAmt = AmtC->getValue().getZExtValue();
+      if (ShiftAmt < TargetWidth && LHSInfo->Kind == ExtKind::ZExt &&
+          LHSInfo->NarrowWidth == TargetWidth) {
+        // trunc(ashr(zext(a:N→W), k), N) = lshr(a, k)
+        IRBuilder<> B(&Tr);
+        auto *NarrowAmt = ConstantInt::get(
+            IntegerType::get(Tr.getContext(), TargetWidth), ShiftAmt);
+        auto *NewLShr = cast<Instruction>(
+            B.CreateLShr(LHSInfo->NarrowValue, NarrowAmt, Tr.getName()));
+        NewLShr->setDebugLoc(Tr.getDebugLoc());
+        Tr.replaceAllUsesWith(NewLShr);
+        Tr.eraseFromParent();
+        if (BO->use_empty())
+          RecursivelyDeleteTriviallyDeadInstructions(BO);
+        return true;
+      }
+      if (LHSInfo->Kind != ExtKind::SExt)
         return false;
     } else {
       return false;
@@ -2221,6 +3184,21 @@ Value *materializeTruncRootedValueAtWidth(Value *V, unsigned TargetWidth,
   }
 
   if (auto *BO = dyn_cast<BinaryOperator>(V)) {
+    // Special case for `and X, C` where C has no bits in the low TargetWidth
+    // positions: trunc(and X, C, TargetWidth) = 0, a free constant.
+    if (BO->getOpcode() == Instruction::And) {
+      for (unsigned Idx = 0; Idx < 2; ++Idx) {
+        if (auto *C = dyn_cast<ConstantInt>(BO->getOperand(Idx))) {
+          APInt LowBits = C->getValue().trunc(TargetWidth);
+          if (LowBits.isZero()) {
+            Value *Zero = ConstantInt::get(TargetTy, 0);
+            if (Cache)
+              (*Cache)[V] = Zero;
+            return Zero;
+          }
+        }
+      }
+    }
     if (!isTruncRootedLowBitsPreservingOpcode(BO->getOpcode())) {
       if (BO->getOpcode() == Instruction::Shl) {
         // shl with a constant amount < TargetWidth is also low-bit preserving.
@@ -2423,6 +3401,25 @@ bool collectTruncRootedValueCost(
 
   if (auto *BO = dyn_cast<BinaryOperator>(V)) {
     if (isTruncRootedLowBitsPreservingOpcode(BO->getOpcode())) {
+      // Special case for `and X, C` where C has no bits in the low TargetWidth
+      // positions: trunc(and X, C, TargetWidth) = 0, a free constant.
+      // This enables the SROA construct/destruct pattern:
+      //   trunc(or(and(X, HIGH_MASK), zext(a)), TargetWidth) == a
+      // because trunc(and(X, HIGH_MASK), TargetWidth) == 0.
+      if (BO->getOpcode() == Instruction::And) {
+        for (unsigned Idx = 0; Idx < 2; ++Idx) {
+          if (auto *C = dyn_cast<ConstantInt>(BO->getOperand(Idx))) {
+            APInt LowBits = C->getValue().trunc(TargetWidth);
+            if (LowBits.isZero()) {
+              // The and contributes 0 to the low TargetWidth bits.
+              // No recursion needed; this is a free constant fold.
+              if (BO->hasOneUse())
+                RemovedInstructions.insert(BO);
+              return true; // Contributes 0, no AddedValues.
+            }
+          }
+        }
+      }
       if (!collectTruncRootedValueCost(BO->getOperand(0), TargetWidth,
                                        AddedValues, RemovedInstructions,
                                        Visited) ||
@@ -3699,6 +4696,23 @@ bool runAnalysisAwareLocalRewrites(Function &F, LazyValueInfo &LVI,
     Changed |= tryConvertSExtToNonNegZExt(*SExt, LVI);
   }
 
+  // When LVI proves the source of a zext is non-negative at this use, mark
+  // the zext nneg so that subsequent structural passes (tryShrinkZExtGEPIndex,
+  // etc.) can eliminate it.
+  for (WeakTrackingVH &VH : WL.ZExts) {
+    auto *ZExt = dyn_cast_or_null<ZExtInst>(VH);
+    if (!ZExt || ZExt->getParent() == nullptr)
+      continue;
+    if (ZExt->hasNonNeg())
+      continue;
+    const Use &SrcUse = ZExt->getOperandUse(0);
+    if (LVI.getConstantRangeAtUse(SrcUse, /*UndefAllowed=*/false)
+            .isAllNonNegative()) {
+      ZExt->setNonNeg();
+      Changed = true;
+    }
+  }
+
   for (WeakTrackingVH &VH : WL.Compares) {
     auto *Cmp = dyn_cast_or_null<ICmpInst>(VH);
     if (!Cmp || Cmp->getParent() == nullptr)
@@ -3724,7 +4738,11 @@ bool runStructuralLocalRewritesToFixpoint(Function &F) {
       auto *Add = dyn_cast_or_null<BinaryOperator>(VH);
       if (!Add || Add->getParent() == nullptr)
         continue;
-      ChangedThisRound |= tryWidenAddThroughZExt(*Add);
+      if (tryWidenAddThroughZExt(*Add)) {
+        ChangedThisRound = true;
+        continue;
+      }
+      ChangedThisRound |= tryWidenAddOverTruncThroughZExt(*Add);
     }
 
     for (WeakTrackingVH &VH : WL.Ands) {
@@ -3734,11 +4752,45 @@ bool runStructuralLocalRewritesToFixpoint(Function &F) {
       ChangedThisRound |= tryFoldAndOfSExtToZExt(*And);
     }
 
+    for (WeakTrackingVH &VH : WL.SExts) {
+      auto *SExt = dyn_cast_or_null<SExtInst>(VH);
+      if (!SExt || SExt->getParent() == nullptr)
+        continue;
+      if (tryShrinkSExtGEPIndex(*SExt)) {
+        ChangedThisRound = true;
+        continue;
+      }
+      if (tryShrinkSExtSwitch(*SExt)) {
+        ChangedThisRound = true;
+        continue;
+      }
+    }
+
     for (WeakTrackingVH &VH : WL.ZExts) {
       auto *ZExt = dyn_cast_or_null<ZExtInst>(VH);
       if (!ZExt || ZExt->getParent() == nullptr)
         continue;
+      if (tryShrinkZExtGEPIndex(*ZExt)) {
+        ChangedThisRound = true;
+        continue;
+      }
+      if (tryShrinkZExtThroughBinopToGEP(*ZExt)) {
+        ChangedThisRound = true;
+        continue;
+      }
+      if (tryShrinkZExtSwitch(*ZExt)) {
+        ChangedThisRound = true;
+        continue;
+      }
+      if (tryShrinkZExtOfLLVMExpect(*ZExt)) {
+        ChangedThisRound = true;
+        continue;
+      }
       if (tryShrinkZExtOfZeroBounded(*ZExt)) {
+        ChangedThisRound = true;
+        continue;
+      }
+      if (tryWidenSubOverTruncThroughZExtNneg(*ZExt)) {
         ChangedThisRound = true;
         continue;
       }
@@ -3762,6 +4814,54 @@ bool runStructuralLocalRewritesToFixpoint(Function &F) {
       auto *Tr = dyn_cast_or_null<TruncInst>(VH);
       if (!Tr || Tr->getParent() == nullptr)
         continue;
+      // Constant-fold trunc iN C to iM when the operand is a constant.
+      // Also handles trunc(lshr/and/or/shl(C1, C2)) by first folding the binop.
+      {
+        Value *TrSrc = Tr->getOperand(0);
+        // If the source is a binop with constant operands, compute the constant.
+        if (auto *BI = dyn_cast<BinaryOperator>(TrSrc)) {
+          auto *C1 = dyn_cast<ConstantInt>(BI->getOperand(0));
+          auto *C2 = dyn_cast<ConstantInt>(BI->getOperand(1));
+          if (C1 && C2) {
+            APInt V;
+            switch (BI->getOpcode()) {
+            case Instruction::LShr:
+              V = C1->getValue().lshr(C2->getValue());
+              break;
+            case Instruction::AShr:
+              V = C1->getValue().ashr(C2->getValue());
+              break;
+            case Instruction::Shl:
+              V = C1->getValue().shl(C2->getValue());
+              break;
+            case Instruction::And:
+              V = C1->getValue() & C2->getValue();
+              break;
+            case Instruction::Or:
+              V = C1->getValue() | C2->getValue();
+              break;
+            default:
+              goto done_const_fold;
+            }
+            TrSrc = ConstantInt::get(BI->getType(), V);
+          }
+        }
+        if (auto *C = dyn_cast<ConstantInt>(TrSrc)) {
+          auto *Folded = ConstantInt::get(Tr->getType(),
+                                          C->getValue().trunc(getValueWidth(Tr)));
+          Tr->replaceAllUsesWith(Folded);
+          Tr->eraseFromParent();
+          DbgVerify("constant-fold-trunc");
+          ChangedThisRound = true;
+          continue;
+        }
+        done_const_fold:;
+      }
+      if (tryShrinkTruncGEPIndex(*Tr)) {
+        DbgVerify("tryShrinkTruncGEPIndex");
+        ChangedThisRound = true;
+        continue;
+      }
       if (tryFoldTruncOfExt(*Tr)) {
         DbgVerify("tryFoldTruncOfExt");
         ChangedThisRound = true;
@@ -3777,8 +4877,23 @@ bool runStructuralLocalRewritesToFixpoint(Function &F) {
         ChangedThisRound = true;
         continue;
       }
+      if (tryFoldTruncToI1WhenSrcIsZeroBounded(*Tr)) {
+        DbgVerify("tryFoldTruncToI1WhenSrcIsZeroBounded");
+        ChangedThisRound = true;
+        continue;
+      }
+      if (tryFoldTruncNuwToI1(*Tr)) {
+        DbgVerify("tryFoldTruncNuwToI1");
+        ChangedThisRound = true;
+        continue;
+      }
       if (tryFoldTruncOfCtpop(*Tr)) {
         DbgVerify("tryFoldTruncOfCtpop");
+        ChangedThisRound = true;
+        continue;
+      }
+      if (tryFoldTruncToI1ViaLShrAndMask(*Tr)) {
+        DbgVerify("tryFoldTruncToI1ViaLShrAndMask");
         ChangedThisRound = true;
         continue;
       }
@@ -3804,6 +4919,16 @@ bool runStructuralLocalRewritesToFixpoint(Function &F) {
       }
       if (tryShrinkTruncOfMinMaxAbs(*Tr)) {
         DbgVerify("tryShrinkTruncOfMinMaxAbs");
+        ChangedThisRound = true;
+        continue;
+      }
+      if (tryShrinkHighHalfSROA(*Tr)) {
+        DbgVerify("tryShrinkHighHalfSROA");
+        ChangedThisRound = true;
+        continue;
+      }
+      if (tryShrinkSROAI128Destruct(*Tr)) {
+        DbgVerify("tryShrinkSROAI128Destruct");
         ChangedThisRound = true;
         continue;
       }

@@ -14,7 +14,7 @@ entry:
 ; CHECK-LABEL: define i16 @f(
 ; CHECK: %[[S:.*]] = select i1 %c, i8 1, i8 2
 ; CHECK: %[[CMP:.*]] = icmp eq i8 %[[S]], %k
-; CHECK: %[[X:.*]] = zext i8 %[[S]] to i16
+; CHECK: %[[X:.*]] = zext nneg i8 %[[S]] to i16
 ; CHECK: %[[CMPZ:.*]] = zext i1 %[[CMP]] to i16
 ; CHECK: %[[R:.*]] = add i16 %[[X]], %[[CMPZ]]
 ; CHECK: ret i16 %[[R]]
