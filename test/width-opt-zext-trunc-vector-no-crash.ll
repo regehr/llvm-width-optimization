@@ -12,5 +12,5 @@ entry:
 
 ; CHECK-LABEL: define <2 x i65> @foo(
 ; CHECK: %[[MASK:.*]] = and <2 x i64> %t, splat (i64 4294967295)
-; CHECK: %[[B:.*]] = zext <2 x i64> %[[MASK]] to <2 x i65>
+; CHECK: %[[B:.*]] = zext{{( nneg)?}} <2 x i64> %[[MASK]] to <2 x i65>
 ; CHECK: ret <2 x i65> %[[B]]

@@ -5617,6 +5617,16 @@ PreservedAnalyses WidthOptPass::run(Function &F, FunctionAnalysisManager &AM) {
   Changed |= runAnalysisAwareLocalRewrites(F, LVI, AC, DT);
   Changed |= runStructuralLocalRewritesToFixpoint(F);
 
+  // The structural pass may have converted sext-based comparisons (e.g.,
+  // icmp sgt i32 (sext i8 %x), 0) to narrower forms (icmp sgt i8 %x, 0).
+  // LVI can now prove nneg for more zext instructions using these tighter
+  // branch constraints. Invalidate the LVI cache and re-run.
+  LVI.clear();
+  if (runAnalysisAwareLocalRewrites(F, LVI, AC, DT)) {
+    Changed = true;
+    runStructuralLocalRewritesToFixpoint(F);
+  }
+
   AnalysisResult R = computeWidthComponents(F);
   PlanResult Plan = computeWidthPlan(R);
 

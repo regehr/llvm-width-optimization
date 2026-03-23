@@ -9,5 +9,5 @@ define i32 @f(i8 %x) {
 
 ; CHECK-LABEL: define i32 @f(
 ; CHECK: %[[M:.*]] = and i8 %x, 15
-; CHECK: %[[E:.*]] = zext i8 %[[M]] to i32
+; CHECK: %[[E:.*]] = zext{{( nneg)?}} i8 %[[M]] to i32
 ; CHECK: ret i32 %[[E]]
